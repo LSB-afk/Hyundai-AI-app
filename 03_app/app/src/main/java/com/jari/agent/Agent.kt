@@ -1,0 +1,248 @@
+package com.jari.agent
+
+enum class SeatId(val label: String) {
+    DRIVER("운전석"), PASSENGER("조수석"), REAR_LEFT("뒷좌석 왼쪽"), REAR_RIGHT("뒷좌석 오른쪽")
+}
+
+enum class WindowId(val label: String) {
+    FL("운전석 창문"), FR("조수석 창문"), RL("뒷좌석 왼쪽 창문"), RR("뒷좌석 오른쪽 창문"), ROOF("선루프")
+}
+
+enum class Axis(val label: String) {
+    FORE_AFT("앞뒤 위치"), RECLINE("등받이"), HEIGHT("높이"), LUMBAR("허리 지지")
+}
+
+/** 시트 축 값은 0..100 (FORE_AFT 클수록 앞, RECLINE 클수록 눕힘). 열선/통풍 0..3단. */
+data class SeatState(
+    val pos: Map<Axis, Int> = DEFAULT_POS,
+    val heat: Int = 0,
+    val vent: Int = 0,
+    val occupied: Boolean = false,
+)
+
+/** 창문 값은 0(닫힘)..100(완전 열림). */
+data class CarState(
+    val seats: Map<SeatId, SeatState>,
+    val windows: Map<WindowId, Int>,
+    val driving: Boolean = false,
+    val live: Boolean = false, // Pleos Vehicle Service 연결 여부
+    val battery: Int = 34, // SoC %
+    val chargeLimit: Int = 80,
+    val charging: Boolean = false,
+    val chargeStart: Int = 34, // 충전 시작 시 SoC (충전량 계산용)
+    val navTo: String? = null, // 길안내 중인 충전소 id
+) {
+    val rangeKm get() = (battery * KM_PER_PERCENT).toInt()
+
+    fun seat(id: SeatId) = seats.getValue(id)
+    fun withSeat(id: SeatId, f: SeatState.() -> SeatState) = copy(seats = seats + (id to seat(id).f()))
+
+    companion object {
+        fun initial() = CarState(
+            seats = SeatId.entries.associateWith {
+                SeatState(occupied = it == SeatId.DRIVER || it == SeatId.PASSENGER)
+            },
+            windows = WindowId.entries.associateWith { 0 },
+        )
+    }
+}
+
+val DEFAULT_POS = mapOf(Axis.FORE_AFT to 50, Axis.RECLINE to 30, Axis.HEIGHT to 50, Axis.LUMBAR to 30)
+private val REST = mapOf(Axis.FORE_AFT to 20, Axis.RECLINE to 85, Axis.HEIGHT to 35, Axis.LUMBAR to 40)
+private val DRIVE = mapOf(Axis.FORE_AFT to 60, Axis.RECLINE to 25, Axis.HEIGHT to 55, Axis.LUMBAR to 60)
+private val EXIT = mapOf(Axis.FORE_AFT to 0, Axis.HEIGHT to 20)
+private val SIDE = listOf(WindowId.FL, WindowId.FR, WindowId.RL, WindowId.RR)
+
+sealed interface Action {
+    data class Seat(val seat: SeatId, val axis: Axis, val value: Int) : Action
+    data class Heat(val seat: SeatId, val level: Int) : Action
+    data class Vent(val seat: SeatId, val level: Int) : Action
+    data class Window(val window: WindowId, val percent: Int) : Action
+    data class Navigate(val stationId: String) : Action
+    data class Charge(val on: Boolean) : Action
+    data class ChargeLimit(val percent: Int) : Action
+}
+
+data class Plan(val actions: List<Action>, val speech: String)
+
+/**
+ * 발화 → 차량 제어 계획. 온디바이스 규칙 기반이라 네트워크 없이 즉시 동작.
+ * ponytail: 키워드 매칭이라 복합 문장("창문 닫고 열선 켜줘")은 첫 의도만 처리. LLM 플래너로 교체 시 plan() 시그니처 유지.
+ */
+object Agent {
+    const val HELP = "좌석이나 창문에 대해 말씀해 주세요. 예: \"허리가 아파\", \"조수석 좀 눕혀줘\", \"창문 반만 열어\""
+
+    /** 주행 중 운전석 자세가 이 값(%)보다 크게 바뀌면 차단. */
+    const val DRIVING_LIMIT = 10
+
+    fun plan(raw: String, s: CarState): Plan {
+        val t = raw.replace(" ", "")
+        if (t.isBlank()) return Plan(emptyList(), HELP)
+        if (t.has("창문", "창", "윈도우", "선루프", "썬루프", "환기", "답답")) return guard(windows(t), s)
+        charging(t, s)?.let { return it }
+
+        val seats = targetSeats(t, s)
+        val off = t.has("꺼", "끄", "그만", "됐어")
+        fun posture(p: Map<Axis, Int>) = seats.flatMap { id -> p.map { (a, v) -> Action.Seat(id, a, v) } }
+
+        val plan = when {
+            t.has("피곤", "졸려", "졸음", "잠와", "잠이와", "쉬고", "휴식", "눕고", "낮잠") -> {
+                if (s.driving && SeatId.DRIVER in seats) return Plan(
+                    listOf(Action.Window(WindowId.FL, 20), Action.Vent(SeatId.DRIVER, 3)),
+                    "주행 중에는 운전석을 눕힐 수 없어요. 대신 창문을 조금 열고 통풍 시트를 켰어요. 가까운 휴게소에서 꼭 쉬어 가세요.",
+                )
+                Plan(posture(REST), "${names(seats)} 휴식 모드로 바꿨어요. 등받이를 눕히고 시트를 뒤로 뺐어요.")
+            }
+            t.has("허리") && !t.has("줄여", "약하게", "빼") -> Plan(
+                seats.flatMap { listOf(Action.Seat(it, Axis.LUMBAR, 80), Action.Heat(it, 2)) },
+                "${names(seats)} 허리 지지대를 높이고 열선을 2단으로 켰어요. 오래 운전하신다면 한 시간마다 스트레칭 해주세요.",
+            )
+            t.has("추워", "춥", "쌀쌀", "따뜻", "열선", "시려") -> {
+                val level = if (off) 0 else level(t)
+                val closeOpen = if (off) emptyList() else SIDE.filter { s.windows.getValue(it) > 0 }.map { Action.Window(it, 0) }
+                Plan(
+                    seats.map { Action.Heat(it, level) } + closeOpen,
+                    if (level == 0) "${names(seats)} 열선을 껐어요."
+                    else "${names(seats)} 열선을 ${level}단으로 켰어요." + if (closeOpen.isNotEmpty()) " 열린 창문도 닫았어요." else "",
+                )
+            }
+            t.has("더워", "덥", "땀", "통풍", "시원", "후끈") -> {
+                val level = if (off) 0 else level(t)
+                Plan(
+                    seats.map { Action.Vent(it, level) },
+                    if (level == 0) "${names(seats)} 통풍을 껐어요." else "${names(seats)} 통풍을 ${level}단으로 켰어요.",
+                )
+            }
+            t.has("원래", "기본", "초기화", "처음") -> Plan(
+                posture(DEFAULT_POS) + seats.flatMap { listOf(Action.Heat(it, 0), Action.Vent(it, 0)) },
+                "${names(seats)} 기본 자세로 되돌렸어요.",
+            )
+            t.has("운전자세", "운전모드", "집중", "똑바로앉") ->
+                Plan(posture(DRIVE), "${names(seats)} 운전하기 좋은 자세로 맞췄어요.")
+            t.has("내릴", "내리기", "타기", "승하차", "탈게", "나갈") ->
+                Plan(posture(EXIT), "${names(seats)} 타고 내리기 편하게 시트를 뒤로 빼고 낮췄어요.")
+            else -> adjust(t, s, seats)
+        }
+        return guard(plan, s)
+    }
+
+    /** 안전 가드: 주행 중 운전석 자세(허리 지지 제외)를 크게 바꾸는 동작은 제거한다. 수동 조작도 이 경로를 탄다. */
+    fun guard(plan: Plan, s: CarState): Plan {
+        if (!s.driving) return plan
+        val blocked = plan.actions.filterIsInstance<Action.Seat>().filter {
+            it.seat == SeatId.DRIVER && it.axis != Axis.LUMBAR &&
+                kotlin.math.abs(it.value - s.seat(SeatId.DRIVER).pos.getValue(it.axis)) > DRIVING_LIMIT
+        }
+        if (blocked.isEmpty()) return plan
+        val kept = plan.actions - blocked.toSet()
+        val note = "주행 중이라 운전석 ${blocked.map { it.axis.label }.distinct().joinToString("·")} 변경은 정차 후에 할게요."
+        return Plan(kept, if (kept.isEmpty()) note else "${plan.speech} 단, $note".trim())
+    }
+
+    private fun adjust(t: String, s: CarState, seats: List<SeatId>): Plan {
+        val amt = amount(t)
+        val recline = t.has("눕혀", "젖혀", "기울", "눕게")
+        val acts = mutableListOf<Action.Seat>()
+        for (id in seats) {
+            fun add(axis: Axis, d: Int) {
+                acts += Action.Seat(id, axis, (s.seat(id).pos.getValue(axis) + d).coerceIn(0, 100))
+            }
+            when {
+                recline -> add(Axis.RECLINE, amt)
+                t.has("세워", "일으켜", "바로세") -> add(Axis.RECLINE, -amt)
+            }
+            when {
+                t.has("앞으로", "당겨") -> add(Axis.FORE_AFT, amt)
+                !recline && t.has("뒤로", "밀어", "공간", "넓게", "빼줘") -> add(Axis.FORE_AFT, -amt)
+            }
+            when {
+                t.has("높여", "올려", "위로") -> add(Axis.HEIGHT, amt)
+                t.has("낮춰", "내려", "아래로") -> add(Axis.HEIGHT, -amt)
+            }
+        }
+        if (acts.isEmpty()) return Plan(emptyList(), HELP)
+        return Plan(acts, acts.joinToString(" ") {
+            "${it.seat.label} ${it.axis.label}를 ${s.seat(it.seat).pos.getValue(it.axis)}%에서 ${it.value}%로 조정했어요."
+        })
+    }
+
+    private fun charging(t: String, s: CarState): Plan? = when {
+        t.has("충전한도", "충전제한", "충전량제한") -> {
+            val p = (percent(t) ?: Regex("(\\d+)").find(t)?.value?.toInt() ?: 80).coerceIn(50, 100)
+            Plan(listOf(Action.ChargeLimit(p)), "충전 한도를 ${p}%로 설정했어요.")
+        }
+        t.has("충전소", "충전기", "충전해야", "배터리부족", "배터리없", "충전할곳") -> {
+            val st = nearestAvailable()
+            Plan(
+                listOf(Action.Navigate(st.id)),
+                "배터리 ${s.battery}%, 약 ${s.rangeKm}km 갈 수 있어요. 가장 가까운 빈 충전기는 ${st.name}, " +
+                    "${st.km}km 거리 ${st.minutes}분이에요. 길안내를 시작할게요.",
+            )
+        }
+        t.has("충전") && t.has("멈춰", "중지", "그만", "끝") ->
+            Plan(listOf(Action.Charge(false)), "충전을 멈췄어요. 현재 배터리는 ${s.battery}%예요.")
+        else -> null
+    }
+
+    private fun windows(t: String): Plan {
+        if (t.has("환기", "답답")) return Plan(SIDE.map { Action.Window(it, 20) }, "환기를 위해 창문을 모두 20% 열었어요.")
+        val targets = when {
+            t.has("선루프", "썬루프", "지붕") -> listOf(WindowId.ROOF)
+            t.has("전부", "모두", "모든", "전체", "다열", "다닫", "다내려", "다올려") -> SIDE
+            t.has("조수석", "옆자리") -> listOf(WindowId.FR)
+            t.has("뒷", "뒤창", "뒤쪽") -> when {
+                t.has("왼") -> listOf(WindowId.RL)
+                t.has("오른") -> listOf(WindowId.RR)
+                else -> listOf(WindowId.RL, WindowId.RR)
+            }
+            else -> listOf(WindowId.FL)
+        }
+        val close = t.has("닫", "올려", "잠가")
+        if (!close && !t.has("열", "내려", "오픈")) return Plan(emptyList(), HELP)
+        val v = if (close) 0 else percent(t) ?: when {
+            t.has("반") -> 50
+            t.has("조금", "살짝", "약간") -> 20
+            else -> 100
+        }
+        val what = if (targets == SIDE) "창문을 모두" else targets.joinToString(", ") { it.label } + josa(targets.last().label)
+        val done = when (v) { 0 -> "닫았어요"; 100 -> "열었어요"; else -> "$v% 열었어요" }
+        return Plan(targets.map { Action.Window(it, v) }, "$what $done.")
+    }
+
+    private fun targetSeats(t: String, s: CarState): List<SeatId> = when {
+        t.has("모든좌석", "전체좌석", "전좌석", "모두", "다같이") ->
+            s.seats.filterValues { it.occupied }.keys.toList().ifEmpty { SeatId.entries }
+        t.has("조수석", "옆자리", "옆사람", "동승") -> listOf(SeatId.PASSENGER)
+        t.has("뒷좌석", "뒷자리", "뒤에앉", "아이자리") -> when {
+            t.has("왼") -> listOf(SeatId.REAR_LEFT)
+            t.has("오른") -> listOf(SeatId.REAR_RIGHT)
+            else -> listOf(SeatId.REAR_LEFT, SeatId.REAR_RIGHT)
+        }
+        else -> listOf(SeatId.DRIVER)
+    }
+
+    private fun amount(t: String) = when {
+        t.has("끝까지", "최대", "완전", "최고") -> 100
+        t.has("많이", "훨씬", "확") -> 35
+        t.has("조금", "살짝", "약간") -> 10
+        else -> 20
+    }
+
+    private fun level(t: String) = when {
+        t.has("1단", "약하게", "조금", "살짝") -> 1
+        t.has("2단", "중간") -> 2
+        else -> 3
+    }
+
+    private fun percent(t: String) = Regex("(\\d+)(%|퍼센트|프로)").find(t)?.groupValues?.get(1)?.toInt()?.coerceIn(0, 100)
+
+    private fun names(seats: List<SeatId>) = seats.joinToString(", ") { it.label }
+
+    /** 받침 있으면 "을", 없으면 "를". */
+    private fun josa(word: String): String {
+        val c = word.last()
+        return if (c in '가'..'힣' && (c - '가') % 28 != 0) "을" else "를"
+    }
+
+    private fun String.has(vararg k: String) = k.any { contains(it) }
+}

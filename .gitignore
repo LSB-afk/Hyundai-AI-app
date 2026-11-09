@@ -1,0 +1,8 @@
+.omc/
+.DS_Store
+.gradle/
+build/
+local.properties
+.idea/
+*.keystore
+*.jks
