@@ -77,6 +77,29 @@ class AgentTest {
         assertEquals(listOf(Action.Open(Opening.TRUNK, false)), Agent.plan("트렁크 닫아줘", driving).actions)
     }
 
+    @Test fun compoundSentence() {
+        val p = Agent.plan("조수석 눕히고 열선 켜줘", parked)
+        assertEquals(listOf(Action.Seat(SeatId.PASSENGER, Axis.RECLINE, 50), Action.Heat(SeatId.PASSENGER, 3)), p.actions)
+        val q = Agent.plan("창문 전부 닫고 통풍 켜줘", parked)
+        assertEquals(SIDE_CLOSED + Action.Vent(SeatId.DRIVER, 3), q.actions)
+        // 못 알아들은 절은 버리고 알아들은 절만 실행
+        assertEquals(listOf(Action.Open(Opening.TRUNK, true)), Agent.plan("트렁크 열고 노래 틀어줘", parked).actions)
+    }
+
+    @Test fun careSpeaksFirst() {
+        val m = CareMonitor()
+        assertEquals(null, m.tick(driving, 119f))
+        assertEquals(Care.LONG_DRIVE, m.tick(driving, 1f))
+        assertEquals(null, m.tick(driving, 1f)) // 같은 일로 반복해서 말 걸지 않는다
+        assertEquals(Care.LOW_BATTERY, m.tick(driving.copy(battery = 18), 1f))
+        assertEquals(Care.ARRIVED_TIRED, m.tick(parked, 1f))
+        assertEquals(null, m.tick(parked, 1f))
+        // 주행 중에 스스로 하는 동작은 안전 가드를 통과해야 한다
+        val plan = CareMonitor.plan(Care.LONG_DRIVE, driving, 120)
+        assertEquals(plan.actions, Agent.guard(plan, driving).actions)
+        assertEquals(listOf(Action.Seat(SeatId.DRIVER, Axis.LUMBAR, 50)), plan.actions)
+    }
+
     @Test fun unknown() {
         assertEquals(Agent.HELP, Agent.plan("오늘 날씨 어때", parked).speech)
     }

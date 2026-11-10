@@ -1,5 +1,6 @@
 package com.jari.agent.ui
 
+import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.animateFloat
@@ -8,6 +9,7 @@ import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.aspectRatio
@@ -17,37 +19,78 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.EvStation
 import androidx.compose.material.icons.rounded.Inventory2
 import androidx.compose.material.icons.rounded.Luggage
+import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.getValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Rect
-import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.geometry.lerp
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.graphics.Matrix
 import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.PathOperation
 import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.clipPath
-import androidx.compose.ui.graphics.drawscope.rotate
 import androidx.compose.ui.graphics.drawscope.scale
+import androidx.compose.ui.graphics.drawscope.withTransform
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.res.imageResource
+import androidx.compose.ui.unit.sp
 import androidx.compose.ui.unit.dp
 import com.jari.agent.Action
 import com.jari.agent.CarState
 import com.jari.agent.Opening
+import com.jari.agent.R
 import com.jari.agent.WindowId
+import kotlin.math.roundToInt
+import kotlinx.coroutines.launch
 
-// 측면 실루엣 좌표계 1000x400, 차 앞쪽이 왼쪽(운전석 쪽 측면).
-private const val CAR_W = 1000f
-private const val CAR_H = 400f
+// 실차 렌더 턴테이블: res/drawable-nodpi/car_00..64.webp (746x494, 한 바퀴 65장 ≈ 5.5° 간격).
+// 0번이 기본 각도(앞-왼쪽 위 3/4 뷰)이고, 열리는 부위는 이 각도에서만 겹쳐 그린다.
+private const val CAR_W = 746f
+private const val CAR_H = 494f
+internal val CAR_FRAMES = intArrayOf(
+    R.drawable.car_00, R.drawable.car_01, R.drawable.car_02, R.drawable.car_03, R.drawable.car_04, R.drawable.car_05, R.drawable.car_06, R.drawable.car_07,
+    R.drawable.car_08, R.drawable.car_09, R.drawable.car_10, R.drawable.car_11, R.drawable.car_12, R.drawable.car_13, R.drawable.car_14, R.drawable.car_15,
+    R.drawable.car_16, R.drawable.car_17, R.drawable.car_18, R.drawable.car_19, R.drawable.car_20, R.drawable.car_21, R.drawable.car_22, R.drawable.car_23,
+    R.drawable.car_24, R.drawable.car_25, R.drawable.car_26, R.drawable.car_27, R.drawable.car_28, R.drawable.car_29, R.drawable.car_30, R.drawable.car_31,
+    R.drawable.car_32, R.drawable.car_33, R.drawable.car_34, R.drawable.car_35, R.drawable.car_36, R.drawable.car_37, R.drawable.car_38, R.drawable.car_39,
+    R.drawable.car_40, R.drawable.car_41, R.drawable.car_42, R.drawable.car_43, R.drawable.car_44, R.drawable.car_45, R.drawable.car_46, R.drawable.car_47,
+    R.drawable.car_48, R.drawable.car_49, R.drawable.car_50, R.drawable.car_51, R.drawable.car_52, R.drawable.car_53, R.drawable.car_54, R.drawable.car_55,
+    R.drawable.car_56, R.drawable.car_57, R.drawable.car_58, R.drawable.car_59, R.drawable.car_60, R.drawable.car_61, R.drawable.car_62, R.drawable.car_63,
+    R.drawable.car_64,
+)
+
+// 아래 겹침 좌표는 처음 맞춘 584x398 기준 → 0번 프레임 위치로 옮기는 배율·오프셋
+private const val OVERLAY_SCALE = 1.06f
+private val OVERLAY_OFFSET = Offset(43.8f, 11.6f)
 
 /** 개폐 속도(ms, 0→100%). 실차 전동 테일게이트 ≈ 3초. */
 private val OPEN_MS = mapOf(Opening.TRUNK to 2800, Opening.FRUNK to 1800, Opening.CHARGE_PORT to 700)
 
-private val TAILGATE_HINGE = Offset(792f, 94f)
-private val HOOD_HINGE = Offset(332f, 180f)
-private val PORT = Rect(852f, 206f, 890f, 234f)
+private val HOOD = polygon(
+    135f to 171f, 150f to 190f, 180f to 205f, 215f to 218f, 245f to 222f, 264f to 222f, 210f to 252f,
+    150f to 284f, 100f to 272f, 60f to 251f, 40f to 238f, 48f to 222f, 60f to 210f, 100f to 185f,
+)
+private val HOOD_HINGE = Offset(135f, 171f)       // 앞유리 아래 경첩선의 한 점
+private val HOOD_NORMAL = Offset(-0.368f, 0.930f) // 경첩선에서 차 앞쪽을 향하는 단위 법선
+private val HOOD_LIFT = Offset(0.08f, -0.6f)      // 완전 열림 시 경첩에서 1px 떨어진 점의 화면 이동량
+private val FRONT_GLASS = polygon(315f to 186f, 324f to 157f, 338f to 137f, 352f to 129f, 374f to 122f, 378f to 172f, 340f to 192f)
+private val REAR_GLASS = polygon(392f to 119f, 428f to 103f, 444f to 102f, 488f to 131f, 470f to 138f, 395f to 168f)
+private val TAILGATE_A = Offset(402f, 50f)        // 지붕 끝 경첩선
+private val TAILGATE_B = Offset(480f, 80f)
+private val TAILGATE_REACH = Offset(50f, -42f)    // 완전 열림 시 끝단이 경첩에서 뻗는 화면 방향
+// ponytail: 이 각도에서는 실제 충전구(우측 뒤)가 안 보여 보이는 쪽 뒤 펜더에 표시한다
+private val PORT = Rect(495f, 131f, 512f, 144f)
 
 /** 차량 외관 + 트렁크·프렁크·충전구 조작. 값은 상태를 따라 실제 개폐 속도로 움직인다. */
 @Composable
@@ -61,12 +104,33 @@ fun ExteriorPanel(state: CarState, onAction: (List<Action>) -> Unit) = Panel {
     val rear by animateFloatAsState(state.windows.getValue(WindowId.RL) / 100f, tween(400), label = "rl")
     val pulse by rememberInfiniteTransition(label = "port")
         .animateFloat(0.4f, 1f, infiniteRepeatable(tween(800), RepeatMode.Reverse), label = "p")
-    Canvas(Modifier.fillMaxWidth().aspectRatio(CAR_W / CAR_H)) {
+    // 가로로 끌면 회전(단위: 프레임). 캔버스 폭만큼 끌면 약 한 바퀴.
+    val turn = remember { Animatable(0f) }
+    val scope = rememberCoroutineScope()
+    val n = CAR_FRAMES.size
+    suspend fun home() = turn.animateTo((turn.value / n).roundToInt() * n.toFloat(), tween(500))
+    val opened = state.openings.values.any { it > 0 } || state.windows.getValue(WindowId.FL) > 0 || state.windows.getValue(WindowId.RL) > 0
+    // 개폐 모션은 기본 각도에서만 그릴 수 있으므로, 상태가 바뀌면 기본 각도로 돌아온다
+    LaunchedEffect(state.openings, state.windows) { home() }
+    val frame = (turn.value.roundToInt() % n + n) % n
+    val car = ImageBitmap.imageResource(CAR_FRAMES[frame])
+    Canvas(
+        Modifier.fillMaxWidth(0.9f).align(Alignment.CenterHorizontally).aspectRatio(CAR_W / CAR_H)
+            .pointerInput(opened) {
+                detectHorizontalDragGestures(
+                    onDragEnd = { if (opened) scope.launch { home() } },
+                ) { _, dx -> scope.launch { turn.snapTo(turn.value + dx / size.width * n) } }
+            },
+    ) {
         val k = size.width / CAR_W
         scale(k, k, pivot = Offset.Zero) {
-            drawCar(anim, front, rear, if (state.charging) pulse else 0f)
+            drawImage(car)
+            if (frame == 0) withTransform({ translate(OVERLAY_OFFSET.x, OVERLAY_OFFSET.y); scale(OVERLAY_SCALE, OVERLAY_SCALE, Offset.Zero) }) {
+                drawOpenings(car, anim, front, rear, if (state.charging) pulse else 0f)
+            }
         }
     }
+    Text("좌우로 끌어서 돌려보기", color = Sub, fontSize = 14.sp, modifier = Modifier.align(Alignment.CenterHorizontally))
     Row(Modifier.padding(top = 12.dp), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
         listOf(
             Opening.FRUNK to Icons.Rounded.Inventory2,
@@ -85,118 +149,69 @@ fun ExteriorPanel(state: CarState, onAction: (List<Action>) -> Unit) = Panel {
     }
 }
 
-private fun DrawScope.drawCar(open: Map<Opening, Float>, front: Float, rear: Float, charge: Float) {
+/** 기본 각도 프레임 [car] 위에 열린 부위를 그린다. 좌표는 584x398 기준(호출부에서 변환). */
+private fun DrawScope.drawOpenings(car: ImageBitmap, open: Map<Opening, Float>, front: Float, rear: Float, charge: Float) {
     val trunk = open.getValue(Opening.TRUNK)
     val hood = open.getValue(Opening.FRUNK)
     val port = open.getValue(Opening.CHARGE_PORT)
-    val paint = Brush.verticalGradient(listOf(Color(0xFFFBFCFE), Color(0xFFE3E8EF), Color(0xFFB9C1CC)), 90f, 320f)
     val edge = Color(0xFF8E98A6)
 
-    // 바닥 그림자
-    drawOval(
-        Brush.radialGradient(listOf(Color(0x33000000), Color.Transparent), Offset(500f, 330f), 480f),
-        Offset(30f, 312f), Size(940f, 40f),
-    )
+    glass(FRONT_GLASS, front, 62f)
+    glass(REAR_GLASS, rear, 52f)
 
-    // 열린 트렁크·프렁크 안쪽(차체보다 먼저)
+    // 프렁크: 원본의 후드 부분을 잘라 경첩선 기준으로 들어 올리고, 그 아래 적재함을 드러낸다
+    if (hood > 0f) {
+        drawPath(HOOD, Brush.verticalGradient(listOf(Color(0xFF14181D), Color(0xFF3A414B)), 171f, 284f), alpha = (hood * 5f).coerceAtMost(1f))
+        val v = HOOD_LIFT * hood
+        val c = -(HOOD_NORMAL.x * HOOD_HINGE.x + HOOD_NORMAL.y * HOOD_HINGE.y)
+        val lift = Matrix().apply { // P' = P + (n·(P−H))·v : 경첩선은 고정, 멀수록 많이 움직인다
+            this[0, 0] = 1f + HOOD_NORMAL.x * v.x; this[1, 0] = HOOD_NORMAL.y * v.x; this[3, 0] = c * v.x
+            this[0, 1] = HOOD_NORMAL.x * v.y; this[1, 1] = 1f + HOOD_NORMAL.y * v.y; this[3, 1] = c * v.y
+        }
+        withTransform({ transform(lift) }) {
+            clipPath(HOOD) {
+                withTransform({ scale(1f / OVERLAY_SCALE, 1f / OVERLAY_SCALE, Offset.Zero); translate(-OVERLAY_OFFSET.x, -OVERLAY_OFFSET.y) }) { drawImage(car) }
+            }
+            drawPath(HOOD, edge, style = Stroke(1.5f))
+        }
+    }
+
+    // 테일게이트: 지붕 끝 경첩에서 뒤·위로 뻗어 나온다(닫힌 상태에서는 차 뒤에 가려 안 보임)
     if (trunk > 0f) {
-        drawPath(polygon(792f to 112f, 866f to 122f, 926f to 184f, 938f to 218f, 942f to 262f, 880f to 262f, 820f to 150f), Color(0xFF2A2F37))
-        drawCircle(Brush.radialGradient(listOf(Color(0xFFFFE2A8).copy(alpha = 0.7f * trunk), Color.Transparent), Offset(880f, 200f), 70f), 70f, Offset(880f, 200f))
+        val o = TAILGATE_REACH * trunk
+        fun quad(inset: Float): Path {
+            val a = lerp(TAILGATE_A, TAILGATE_B, inset)
+            val b = lerp(TAILGATE_B, TAILGATE_A, inset)
+            return polygon(
+                (a + o * inset).let { it.x to it.y }, (b + o * inset).let { it.x to it.y },
+                (b + o * (1f - inset)).let { it.x to it.y }, (a + o * (1f - inset)).let { it.x to it.y },
+            )
+        }
+        val lid = quad(0f)
+        drawPath(lid, Brush.linearGradient(listOf(Color(0xFFF2F4F7), Color(0xFFA9B1BC)), TAILGATE_A + o, TAILGATE_B))
+        drawPath(quad(0.16f), Color(0xFF1C2129)) // 뒷유리
+        drawPath(lid, edge, style = Stroke(1.5f))
     }
-    if (hood > 0f) drawPath(polygon(80f to 214f, 332f to 186f, 332f to 204f, 90f to 232f), Color(0xFF2A2F37))
-
-    // 차체(트렁크 리드·후드는 따로 그린다)
-    val body = Path().apply {
-        moveTo(48f, 300f)
-        lineTo(36f, 262f)
-        cubicTo(36f, 240f, 50f, 222f, 76f, 214f)
-        lineTo(332f, 188f)
-        lineTo(470f, 98f)
-        quadraticTo(640f, 84f, 792f, 94f)
-        lineTo(792f, 112f)
-        lineTo(866f, 122f)
-        lineTo(926f, 184f)
-        lineTo(938f, 218f)
-        lineTo(942f, 262f)
-        lineTo(964f, 262f)
-        lineTo(966f, 292f)
-        lineTo(950f, 312f)
-        lineTo(868f, 312f)
-        arcTo(Rect(Offset(780f, 312f), 88f), 0f, -180f, false)
-        lineTo(308f, 312f)
-        arcTo(Rect(Offset(220f, 312f), 88f), 0f, -180f, false)
-        lineTo(56f, 312f)
-        close()
-    }
-    drawPath(body, paint)
-    drawPath(body, edge, style = Stroke(2f))
-
-    // 유리: 창문 값만큼 위에서부터 내려간다 → 그만큼 실내가 보임
-    glass(polygon(360f to 186f, 474f to 112f, 596f to 106f, 596f to 190f), front)
-    glass(polygon(616f to 190f, 616f to 106f, 790f to 104f, 852f to 120f, 896f to 182f), rear)
-    drawPath(polygon(596f to 106f, 616f to 106f, 616f to 192f, 596f to 192f), Color(0xFF1C2129)) // B필러
-
-    // 디테일: 벨트라인, 도어 라인, 손잡이, 하부 클래딩, 등화
-    drawLine(Color.White.copy(alpha = 0.9f), Offset(340f, 196f), Offset(930f, 190f), 3f)
-    drawLine(Color(0xFFC3CAD4), Offset(120f, 252f), Offset(930f, 238f), 2f)
-    drawLine(edge, Offset(606f, 194f), Offset(606f, 304f), 1.5f)
-    drawLine(edge, Offset(340f, 192f), Offset(330f, 300f), 1.5f)
-    drawLine(edge, Offset(872f, 192f), Offset(860f, 262f), 1.5f)
-    drawRoundRect(Color(0xFF9AA4B2), Offset(520f, 206f), Size(46f, 8f), CornerRadius(4f))
-    drawRoundRect(Color(0xFF9AA4B2), Offset(790f, 204f), Size(46f, 8f), CornerRadius(4f))
-    drawRect(Color(0xFF3A414B), Offset(308f, 296f), Size(384f, 16f))
-    drawRoundRect(Color(0xFFE8F4FF), Offset(38f, 228f), Size(80f, 7f), CornerRadius(4f))
-    drawRoundRect(Color(0xFFE5484D), Offset(930f, 204f), Size(34f, 7f), CornerRadius(4f))
-    wheel(Offset(220f, 312f))
-    wheel(Offset(780f, 312f))
 
     // 충전구: 소켓 → 덮개가 앞쪽 경첩을 축으로 접힌다
     if (port > 0f) {
-        drawRoundRect(Color(0xFF15191F), PORT.topLeft, PORT.size, CornerRadius(6f))
+        drawRoundRect(Color(0xFF15191F), PORT.topLeft, PORT.size, CornerRadius(3f))
         val ring = if (charge > 0f) Color(0xFF2BD47D).copy(alpha = charge) else Color(0xFF2BD47D).copy(alpha = 0.6f * port)
-        drawCircle(ring, 8f, PORT.center, style = Stroke(3f))
-    }
-    scale(1f - 0.85f * port, 1f, pivot = PORT.centerLeft) {
-        drawRoundRect(Color(0xFFDDE3EA), PORT.topLeft, PORT.size, CornerRadius(6f))
-        drawRoundRect(edge, PORT.topLeft, PORT.size, CornerRadius(6f), style = Stroke(1.5f))
-    }
-
-    // 테일게이트: 지붕 끝 경첩에서 위로 최대 55°
-    rotate(-55f * trunk, TAILGATE_HINGE) {
-        val lid = polygon(792f to 92f, 882f to 104f, 950f to 178f, 964f to 216f, 966f to 262f, 942f to 262f, 938f to 218f, 926f to 184f, 866f to 122f, 792f to 112f)
-        drawPath(lid, paint)
-        drawPath(lid, edge, style = Stroke(2f))
-        drawRoundRect(Color(0xFFE5484D), Offset(946f, 204f), Size(18f, 7f), CornerRadius(4f))
-    }
-    // 프렁크(후드): 앞유리 쪽 경첩에서 앞이 들린다, 최대 26°
-    rotate(26f * hood, HOOD_HINGE) {
-        val lid = polygon(66f to 210f, 332f to 178f, 338f to 188f, 78f to 220f)
-        drawPath(lid, paint)
-        drawPath(lid, edge, style = Stroke(2f))
+        drawCircle(ring, 3.5f, PORT.center, style = Stroke(1.8f))
+        scale(1f - 0.85f * port, 1f, pivot = PORT.centerLeft) {
+            drawRoundRect(Color(0xFFDDE3EA), PORT.topLeft, PORT.size, CornerRadius(3f))
+            drawRoundRect(edge, PORT.topLeft, PORT.size, CornerRadius(3f), style = Stroke(1f))
+        }
     }
 }
 
-private fun DrawScope.glass(shape: Path, open: Float) {
-    val b = shape.getBounds()
-    drawPath(shape, Color(0xFFD9DEE5)) // 실내
-    drawCircle(Color(0xFF4A5260), 22f, Offset(b.left + b.width * 0.55f, b.top + 34f)) // 헤드레스트
-    clipPath(shape) {
-        val top = b.top + b.height * open
-        drawRect(
-            Brush.verticalGradient(listOf(Color(0xFF2A3442), Color(0xFF4C5868)), top, b.bottom),
-            Offset(b.left, top), Size(b.width, b.bottom - top),
-        )
-        if (open > 0.02f) drawLine(Color.White.copy(alpha = 0.8f), Offset(b.left, top), Offset(b.right, top), 2f)
-    }
-}
-
-private fun DrawScope.wheel(c: Offset) {
-    drawCircle(Color(0xFF1B1E23), 70f, c)
-    drawCircle(Brush.radialGradient(listOf(Color(0xFFE7EBF0), Color(0xFF8D96A3)), c, 50f), 50f, c)
-    repeat(5) { i ->
-        rotate(i * 72f, c) { drawLine(Color(0xFF59616D), c, c + Offset(0f, -46f), 9f) }
-    }
-    drawCircle(Color(0xFF3A414B), 11f, c)
+/** 유리가 [open] 만큼 아래로 내려가고, 내려간 자리(위쪽)는 실내가 들여다보인다. [drop] = 완전 개방 시 이동량. */
+private fun DrawScope.glass(shape: Path, open: Float, drop: Float) {
+    if (open <= 0f) return
+    val lowered = Path().apply { addPath(shape, Offset(0f, drop * open)) }
+    val gap = Path().apply { op(shape, lowered, PathOperation.Difference) }
+    drawPath(gap, Color(0xFFAEB6C1))
+    drawPath(gap, Color.White.copy(alpha = 0.7f), style = Stroke(1f))
 }
 
 private fun polygon(vararg p: Pair<Float, Float>) = Path().apply {

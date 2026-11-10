@@ -74,7 +74,8 @@ data class Plan(val actions: List<Action>, val speech: String)
 
 /**
  * 발화 → 차량 제어 계획. 온디바이스 규칙 기반이라 네트워크 없이 즉시 동작.
- * ponytail: 키워드 매칭이라 복합 문장("창문 닫고 열선 켜줘")은 첫 의도만 처리. LLM 플래너로 교체 시 plan() 시그니처 유지.
+ * 복합 문장("조수석 눕히고 열선 켜줘")은 절 단위로 나눠 각각 해석하고, 좌석 지칭은 앞 절에서 이어받는다.
+ * ponytail: 키워드 매칭이라 사전에 없는 표현은 못 알아듣는다. LLM 플래너로 교체 시 plan() 시그니처 유지.
  */
 object Agent {
     const val HELP = "좌석이나 창문에 대해 말씀해 주세요. 예: \"허리가 아파\", \"조수석 좀 눕혀줘\", \"창문 반만 열어\""
@@ -82,7 +83,24 @@ object Agent {
     /** 주행 중 운전석 자세가 이 값(%)보다 크게 바뀌면 차단. */
     const val DRIVING_LIMIT = 10
 
+    private val CLAUSE = Regex("그리고|(?<=[가-힣])(?<!최)고\\s+|,\\s*|다음에?\\s+")
+    private val SEAT_WORD = Regex("모든 ?좌석|전체 ?좌석|전좌석|운전석|조수석|옆자리|뒷좌석 ?(왼쪽|오른쪽)?|뒷자리 ?(왼쪽|오른쪽)?")
+
     fun plan(raw: String, s: CarState): Plan {
+        val clauses = raw.split(CLAUSE).map { it.trim() }.filter { it.isNotEmpty() }
+        if (clauses.size < 2) return planOne(raw, s)
+        var seat = ""
+        val plans = clauses.map { c ->
+            val named = SEAT_WORD.find(c)?.value
+            if (named != null) seat = named
+            planOne(if (named == null && seat.isNotEmpty()) "$seat $c" else c, s)
+        }.filter { it.speech != HELP }
+        // 나눴더니 아무 절도 못 알아들었으면 문장 전체로 다시 본다
+        if (plans.isEmpty()) return planOne(raw, s)
+        return Plan(plans.flatMap { it.actions }.distinct(), plans.joinToString(" ") { it.speech })
+    }
+
+    private fun planOne(raw: String, s: CarState): Plan {
         val t = raw.replace(" ", "")
         if (t.isBlank()) return Plan(emptyList(), HELP)
         if (t.has("창문", "창", "윈도우", "선루프", "썬루프", "환기", "답답")) return guard(windows(t), s)
@@ -168,7 +186,7 @@ object Agent {
 
     private fun adjust(t: String, s: CarState, seats: List<SeatId>): Plan {
         val amt = amount(t)
-        val recline = t.has("눕혀", "젖혀", "기울", "눕게")
+        val recline = t.has("눕혀", "눕히", "젖혀", "젖히", "기울", "눕게")
         val acts = mutableListOf<Action.Seat>()
         for (id in seats) {
             fun add(axis: Axis, d: Int) {
@@ -176,15 +194,15 @@ object Agent {
             }
             when {
                 recline -> add(Axis.RECLINE, amt)
-                t.has("세워", "일으켜", "바로세") -> add(Axis.RECLINE, -amt)
+                t.has("세워", "세우", "일으켜", "일으키", "바로세") -> add(Axis.RECLINE, -amt)
             }
             when {
-                t.has("앞으로", "당겨") -> add(Axis.FORE_AFT, amt)
+                t.has("앞으로", "당겨", "당기") -> add(Axis.FORE_AFT, amt)
                 !recline && t.has("뒤로", "밀어", "공간", "넓게", "빼줘") -> add(Axis.FORE_AFT, -amt)
             }
             when {
-                t.has("높여", "올려", "위로") -> add(Axis.HEIGHT, amt)
-                t.has("낮춰", "내려", "아래로") -> add(Axis.HEIGHT, -amt)
+                t.has("높여", "올려", "올리", "위로") -> add(Axis.HEIGHT, amt)
+                t.has("낮춰", "낮추", "내려", "아래로") -> add(Axis.HEIGHT, -amt)
             }
         }
         if (acts.isEmpty()) return Plan(emptyList(), HELP)
@@ -272,4 +290,60 @@ object Agent {
     }
 
     private fun String.has(vararg k: String) = k.any { contains(it) }
+}
+
+/** 요청이 없어도 차량 신호만 보고 JARI가 먼저 챙기는 상황. */
+enum class Care { LONG_DRIVE, ARRIVED_TIRED, LOW_BATTERY }
+
+/**
+ * 기어(주행 여부)·배터리 신호를 시간에 따라 지켜보다가 챙길 순간을 알려준다.
+ * 2시간 기준은 "2시간 운전 후 15분 휴식" 장거리 운전 권고를 따른 것.
+ * ponytail: 잠깐 정차(P)해도 연속 운전 시간이 초기화된다. 필요하면 정차 유예 시간을 둔다.
+ */
+class CareMonitor {
+    private var driveMin = 0f
+    private var nextLong = LONG_DRIVE_MIN
+    private var lowWarned = false
+
+    val drivingMinutes get() = driveMin.toInt()
+
+    /** [minutes] = 지난 호출 이후 흐른 시간(분). 챙길 일이 생긴 순간에만 값을 돌려준다. */
+    fun tick(s: CarState, minutes: Float): Care? {
+        if (!s.driving) {
+            val tired = driveMin >= TIRED_MIN
+            driveMin = 0f; nextLong = LONG_DRIVE_MIN; lowWarned = false
+            return if (tired) Care.ARRIVED_TIRED else null
+        }
+        driveMin += minutes
+        return when {
+            driveMin >= nextLong -> { nextLong += LONG_DRIVE_MIN; Care.LONG_DRIVE }
+            s.battery <= LOW_BATTERY && !lowWarned -> { lowWarned = true; Care.LOW_BATTERY }
+            else -> null
+        }
+    }
+
+    companion object {
+        const val LONG_DRIVE_MIN = 120f
+        const val TIRED_MIN = 60f
+        const val LOW_BATTERY = 20
+
+        /** 상황별로 JARI가 스스로 하는 일. 주행 중에도 안전한 동작(허리 지지·통풍)만 실행하고 나머지는 제안만 한다. */
+        fun plan(care: Care, s: CarState, minutes: Int): Plan = when (care) {
+            Care.LONG_DRIVE -> {
+                val lumbar = s.seat(SeatId.DRIVER).pos.getValue(Axis.LUMBAR)
+                Plan(
+                    listOf(Action.Seat(SeatId.DRIVER, Axis.LUMBAR, if (lumbar >= 60) lumbar - 20 else lumbar + 20)),
+                    "${minutes / 60}시간째 운전 중이에요. 같은 곳이 계속 눌리지 않게 허리 지지대 위치를 바꿨어요. 다음 휴게소에서 잠깐 쉬어 가세요.",
+                )
+            }
+            Care.ARRIVED_TIRED -> Plan(
+                emptyList(),
+                "${if (minutes >= 60) "${minutes / 60}시간 " else ""}${if (minutes % 60 > 0) "${minutes % 60}분 " else ""}운전하셨어요. 수고하셨어요. \"쉬고 싶어\"라고 하시면 휴식 자세로 바꿔 드릴게요.",
+            )
+            Care.LOW_BATTERY -> Plan(
+                emptyList(),
+                "배터리가 ${s.battery}%, 약 ${s.rangeKm}km 남았어요. \"충전소 찾아줘\"라고 하시면 빈 충전기로 안내할게요.",
+            )
+        }
+    }
 }

@@ -21,6 +21,19 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Rect
+import androidx.compose.foundation.clickable
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.foundation.gestures.detectHorizontalDragGestures
+import androidx.compose.animation.core.Animatable
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import kotlinx.coroutines.launch
+import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.PathOperation
+import androidx.compose.ui.graphics.drawscope.DrawTransform
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.BlendMode
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
@@ -77,6 +90,25 @@ fun rememberSeatAnims(state: CarState): Map<SeatId, SeatAnim> = SeatId.entries.a
 private const val ART_W = 1536f
 private const val ART_H = 1024f
 
+// 시트를 감싸는 차체: 턴테이블 프레임(746x494) 중 옆모습(HOME_FRAME)을 반투명으로 깔고 그 안에 시트를 놓는다.
+// 좌우로 끌면 차가 돌고 놓은 각도에 머문다. 시트 그림은 한 각도뿐이라 옆모습에서만 보이며,
+// 옆모습 근처에서 놓거나 "좌석 보기"를 누르면 옆모습으로 맞춰진다.
+private const val HOME_FRAME = 58
+// 프레임 px → 아트워크 좌표 = px * CAR_SCALE + CAR_AT. 시트·프레임 중 하나라도 바꾸면 다시 맞춰야 한다.
+private const val CAR_SCALE = 5f
+private val CAR_AT = Offset(-1175f, -590f)
+/** 화면에 담는 범위(아트워크 좌표). 어느 각도로 돌려도 차가 잘리지 않는 크기. */
+private val SCENE = Rect(-1090f, -300f, 2470f, 1700f)
+
+// 선루프 위치(프레임 px, 옆모습 기준)
+private val GLASS_ROOF = pathOf(325f to 105f, 400f to 96f, 492f to 99f, 510f to 146f, 400f to 148f, 350f to 152f)
+
+private fun pathOf(vararg p: Pair<Float, Float>) = Path().apply {
+    moveTo(p[0].first, p[0].second)
+    p.drop(1).forEach { lineTo(it.first, it.second) }
+    close()
+}
+
 private enum class Kind { BACK, CUSHION, FIXED }
 
 /** seat_* 레이어. 뒤에 있는 것부터 그린다(조수석 → 뒷좌석 → 고정부 → 운전석). */
@@ -119,12 +151,12 @@ private fun slide(id: SeatId, a: SeatAnim): Offset {
 
 private fun recline(id: SeatId, a: SeatAnim) = (a[Axis.RECLINE] - 30f) * if (id in FRONT) 0.2f else 0.12f
 
-// 마커 위치(아트워크 비율). 앞좌석 마커는 시트를 따라 움직인다.
+// 터치 영역 중심(아트워크 비율). 앞좌석은 시트를 따라 움직인다.
 private val SEAT_POINTS = mapOf(
     SeatId.DRIVER to (0.25f to 0.74f),
     SeatId.PASSENGER to (0.28f to 0.38f),
-    SeatId.REAR_LEFT to (0.80f to 0.64f),
-    SeatId.REAR_RIGHT to (0.67f to 0.39f),
+    SeatId.REAR_LEFT to (0.85f to 0.56f),
+    SeatId.REAR_RIGHT to (0.66f to 0.36f),
 )
 
 /** 실사 시트 아트워크. 레이어를 시트 값대로 움직여 실제 시트 동작을 보여 준다. */
@@ -138,27 +170,66 @@ fun Cabin3D(
     side: Boolean = false,
 ) {
     val bitmaps = LAYERS.map { ImageBitmap.imageResource(it.res) }
+    val roof by animateFloatAsState(state.windows.getValue(WindowId.ROOF) / 100f, tween(400), label = "roof")
     val pulse by rememberInfiniteTransition(label = "seatPulse")
         .animateFloat(0.35f, 1f, infiniteRepeatable(tween(700), RepeatMode.Reverse), label = "p")
+    // 옆모습에서 몇 프레임 돌아갔는지. 0(또는 한 바퀴의 배수)이면 시트가 보이는 기본 각도.
+    val n = CAR_FRAMES.size
+    val turn = remember { Animatable(0f) }
+    val scope = rememberCoroutineScope()
+    val home = (turn.value / n).roundToInt() * n.toFloat()
+    val away = (abs(turn.value - home) / 2.5f).coerceAtMost(1f) // 0 = 기본 각도, 1 = 완전히 돌아감
+    val frame = ((HOME_FRAME + turn.value.roundToInt()) % n + n) % n
+    val car = ImageBitmap.imageResource(CAR_FRAMES[frame])
     Column(modifier) {
-        Text("좌석을 눌러 선택하세요", color = Sub, fontSize = 14.sp, modifier = Modifier.padding(4.dp))
+        Text("좌석을 누르면 선택 · 좌우로 끌면 차량 회전", color = Sub, fontSize = 14.sp, modifier = Modifier.padding(4.dp))
         BoxWithConstraints(Modifier.weight(1f).fillMaxWidth()) {
-            val artWidth = minOf(maxWidth, maxHeight * (ART_W / ART_H))
-            val artHeight = artWidth * (ART_H / ART_W)
-            Box(Modifier.size(artWidth, artHeight).align(Alignment.Center)) {
+            val sceneWidth = minOf(maxWidth, maxHeight * (SCENE.width / SCENE.height))
+            val sceneHeight = sceneWidth * (SCENE.height / SCENE.width)
+            val unit = sceneWidth / SCENE.width.dp // 아트워크 1px = unit dp
+            Box(
+                Modifier.size(sceneWidth, sceneHeight).align(Alignment.Center).pointerInput(Unit) {
+                    // 옆모습에서 4프레임(약 22°) 안쪽에 놓으면 옆모습으로 붙고, 그 밖이면 놓은 자리에 머문다
+                    val settle = {
+                        val h = (turn.value / n).roundToInt() * n.toFloat()
+                        if (abs(turn.value - h) <= 4f) scope.launch { turn.animateTo(h, tween(300)) }
+                        Unit
+                    }
+                    detectHorizontalDragGestures(onDragEnd = settle, onDragCancel = settle) { _, dx ->
+                        scope.launch { turn.snapTo(turn.value + dx / size.width * n) }
+                    }
+                },
+            ) {
+                val toScene: DrawTransform.() -> Unit = {
+                    val k = size.width / SCENE.width
+                    scale(k, k, pivot = Offset.Zero); translate(-SCENE.left, -SCENE.top)
+                }
+                // 차체: 기본 각도에서는 시트가 비치게 반투명, 돌리는 동안은 선명하게
                 Canvas(Modifier.fillMaxSize()) {
-                    val k = size.width / ART_W
-                    scale(k, k, pivot = Offset.Zero) {
-                        LAYERS.forEachIndexed { i, l -> drawLayer(l, bitmaps[i], l.seat?.let(anims::getValue), pulse) }
+                    withTransform({ toScene(); translate(CAR_AT.x, CAR_AT.y); scale(CAR_SCALE, CAR_SCALE, Offset.Zero) }) {
+                        drawImage(car, alpha = 0.55f + 0.45f * away)
+                        if (away == 0f) drawRoofOpening(roof)
                     }
                 }
-                SeatId.entries.forEach { id ->
+                Canvas(Modifier.fillMaxSize().graphicsLayer { alpha = 1f - away }) {
+                    withTransform(toScene) {
+                        LAYERS.forEachIndexed { i, l -> drawLayer(l, bitmaps[i], l.seat?.let(anims::getValue), pulse, l.seat == selected) }
+                    }
+                }
+                if (away >= 0.5f) Text(
+                    "좌석 보기", color = Color.White, fontSize = 14.sp, fontWeight = FontWeight.SemiBold,
+                    modifier = Modifier.align(Alignment.BottomCenter).clip(RoundedCornerShape(50))
+                        .clickable { scope.launch { turn.animateTo(home, tween(600)) } }
+                        .background(Blue).padding(horizontal = 18.dp, vertical = 12.dp),
+                )
+                if (away < 0.5f) SeatId.entries.forEach { id ->
                     val (x, y) = SEAT_POINTS.getValue(id)
-                    val move = slide(id, anims.getValue(id)) * (artWidth / ART_W.dp)
+                    val at = Offset(ART_W * x - SCENE.left, ART_H * y - SCENE.top) + slide(id, anims.getValue(id))
+                    // 터치 영역은 시트 크기에 맞춰 키운다(시트 한 개 ≈ 아트워크 340px)
+                    val touch = (340f * unit).dp.coerceAtLeast(48.dp)
                     SeatMarker(
                         id, anims.getValue(id), selected == id, { onSeatTap(id) },
-                        Modifier.absoluteOffset(x = artWidth * x - 53.dp + move.x.dp, y = artHeight * y - 24.dp + move.y.dp)
-                            .width(106.dp),
+                        Modifier.absoluteOffset(x = (at.x * unit).dp - touch / 2, y = (at.y * unit).dp - touch / 2).size(touch),
                     )
                 }
             }
@@ -167,7 +238,15 @@ fun Cabin3D(
     }
 }
 
-private fun DrawScope.drawLayer(l: Layer, bmp: ImageBitmap, a: SeatAnim?, pulse: Float) {
+/** 선루프는 유리가 뒤로 밀리며 앞쪽부터 열린다. 열린 자리는 실내가 밝게 보인다. */
+private fun DrawScope.drawRoofOpening(open: Float) {
+    if (open <= 0f) return
+    val hole = Path().apply { op(GLASS_ROOF, Path().apply { addPath(GLASS_ROOF, Offset(150f * open, 0f)) }, PathOperation.Difference) }
+    drawPath(hole, Color(0xFFEFF3F8))
+    drawPath(hole, Blue, alpha = 0.8f, style = Stroke(1.2f))
+}
+
+private fun DrawScope.drawLayer(l: Layer, bmp: ImageBitmap, a: SeatAnim?, pulse: Float, selected: Boolean) {
     if (l.seat == null || a == null) {
         drawImage(bmp, topLeft = l.at)
         return
@@ -179,6 +258,8 @@ private fun DrawScope.drawLayer(l: Layer, bmp: ImageBitmap, a: SeatAnim?, pulse:
         if (l.kind == Kind.BACK) rotate(recline(id, a), hinge)
     }) {
         drawImage(bmp, topLeft = l.at)
+        // 선택한 좌석은 시트 자체를 파랗게 물들여 표시한다(마커 없음)
+        if (selected) drawImage(bmp, topLeft = l.at, colorFilter = ColorFilter.tint(Blue.copy(alpha = 0.38f), BlendMode.SrcAtop))
         // 열선/통풍은 시트 표면에 은은한 색, 작동 중인 부위는 파랗게 깜빡임
         val axes = if (l.kind == Kind.BACK) listOf(Axis.RECLINE, Axis.LUMBAR) else listOf(Axis.FORE_AFT, Axis.HEIGHT)
         val moving = axes.any { it in a.moving } || (id in FRONT && l.kind == Kind.BACK && (Axis.FORE_AFT in a.moving || Axis.HEIGHT in a.moving))
@@ -197,6 +278,7 @@ private fun DrawScope.drawLayer(l: Layer, bmp: ImageBitmap, a: SeatAnim?, pulse:
     }
 }
 
+/** 보이지 않는 터치 영역. 선택 표시는 시트 색으로 하고, 이름·상태는 읽기 도구용 설명으로만 남긴다. */
 @Composable
 private fun SeatMarker(id: SeatId, seat: SeatAnim, selected: Boolean, onClick: () -> Unit, modifier: Modifier) {
     val heat = seat.heat.roundToInt()
@@ -207,48 +289,13 @@ private fun SeatMarker(id: SeatId, seat: SeatAnim, selected: Boolean, onClick: (
         if (vent > 0) "통풍 ${vent}단" else null,
         if (seat.moving.isNotEmpty()) "조절 중" else null,
     ).joinToString(", ")
-    Column(
-        modifier.clip(RoundedCornerShape(12.dp))
+    Box(
+        modifier.clip(CircleShape)
             .selectable(selected = selected, role = Role.RadioButton, onClick = onClick)
             .semantics(mergeDescendants = true) {
                 contentDescription = id.label
                 stateDescription = status
-            }.padding(vertical = 2.dp),
-        horizontalAlignment = Alignment.CenterHorizontally,
-    ) {
-        Box(Modifier.size(48.dp), contentAlignment = Alignment.Center) {
-            Box(
-                Modifier.size(40.dp).background(Color.White.copy(alpha = 0.96f), CircleShape)
-                    .border(if (selected) 3.dp else 2.dp, if (selected) Blue else Line, CircleShape),
-                contentAlignment = Alignment.Center,
-            ) {
-                Box(Modifier.size(14.dp).border(4.dp, if (selected) Blue else Ink, CircleShape))
-            }
-            if (seat.occupied) Box(
-                Modifier.align(Alignment.TopEnd).padding(3.dp).size(10.dp)
-                    .background(Navy, CircleShape).border(2.dp, Color.White, CircleShape),
-            )
-        }
-        Text(
-            id.label, color = if (selected) Color.White else Ink, fontSize = 13.sp,
-            fontWeight = FontWeight.SemiBold,
-            modifier = Modifier.clip(RoundedCornerShape(50)).background(if (selected) Blue else Color.White.copy(alpha = 0.94f))
-                .padding(horizontal = 8.dp, vertical = 3.dp),
-        )
-        Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-            if (heat > 0) SeatStatus("열선 $heat", Warm)
-            if (vent > 0) SeatStatus("통풍 $vent", Cool)
-        }
-        if (seat.moving.isNotEmpty()) SeatStatus("조절 중", Blue)
-    }
-}
-
-@Composable
-private fun SeatStatus(text: String, color: Color) {
-    Text(
-        text, fontSize = 11.sp, color = color, fontWeight = FontWeight.SemiBold,
-        modifier = Modifier.padding(top = 3.dp).clip(RoundedCornerShape(50))
-            .background(Color.White.copy(alpha = 0.96f)).padding(horizontal = 5.dp, vertical = 2.dp),
+            },
     )
 }
 

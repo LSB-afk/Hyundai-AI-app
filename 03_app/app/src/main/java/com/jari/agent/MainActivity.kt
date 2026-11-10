@@ -1,5 +1,6 @@
 package com.jari.agent
 
+import android.content.pm.ApplicationInfo
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -9,6 +10,8 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.lifecycle.lifecycleScope
 import com.jari.agent.ui.App
 import com.jari.agent.ui.JariTheme
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 
 data class AgentUi(
     val heard: String = "",
@@ -32,6 +35,7 @@ class MainActivity : ComponentActivity() {
             onListening = { ui.value = ui.value.copy(listening = it) },
             onRms = { ui.value = ui.value.copy(rms = it) },
         )
+        watchCare()
         setContent {
             JariTheme {
                 val state by car.state.collectAsState()
@@ -56,6 +60,25 @@ class MainActivity : ComponentActivity() {
             history = (listOf(text to plan.speech) + ui.value.history).take(5),
         )
         voice.speak(plan.speech)
+    }
+
+    /**
+     * 차량 신호를 1초마다 살펴 JARI가 먼저 말을 건다(연속 운전 2시간, 장거리 후 정차, 배터리 부족).
+     * debug 빌드는 시연용으로 1초를 1분으로 센다(2분이면 "2시간 운전"). release 빌드는 실제 시간.
+     */
+    private fun watchCare() = lifecycleScope.launch {
+        val monitor = CareMonitor()
+        val minPerSec = if (applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE != 0) 1f else 1f / 60f
+        while (true) {
+            delay(1000)
+            val s = car.state.value
+            val drove = monitor.drivingMinutes
+            val care = monitor.tick(s, minPerSec) ?: continue
+            val plan = CareMonitor.plan(care, s, if (care == Care.ARRIVED_TIRED) drove else monitor.drivingMinutes)
+            car.execute(plan.actions)
+            ui.value = ui.value.copy(reply = plan.speech, history = (listOf("JARI가 먼저" to plan.speech) + ui.value.history).take(5))
+            voice.speak(plan.speech)
+        }
     }
 
     /** 화면 수동 조작도 같은 안전 가드를 거친다. */
