@@ -19,11 +19,19 @@
 
 ![charging](../02_기획서/화면시안/landscape_charging.png)
 
-## 실내 3D 시뮬레이션 (`ui/Cabin3D.kt`)
-- 의존성 없는 lowpoly 3D 렌더러 (원근 투영 + 램버트 셰이딩 + 깊이 정렬)
-- 드래그 회전, 시점 프리셋(3D / 위 / 측면). 측면은 도어를 걷어낸 컷어웨이
-- 시트 앞뒤·높이·등받이(힌지 회전)·허리 지지, 창문 유리 하강, 열선·통풍, 탑승자가 실시간 반영
-- 파트 구분은 Pleos glTF 네이밍(`Seat_F_L_Top/Low`)을 따름 → Filament + glTF 모델 확보 시 렌더 계층만 교체
+## 실내 시트 모션 (`ui/Cabin3D.kt`)
+- 실사 시트 아트워크를 부위별 레이어(앞좌석 등받이·방석, 뒷좌석 60:40 등받이)로 분리 (`design/cut_seats.py`)
+- 시트 값 그대로 움직임: 앞뒤 = 레일 방향 이동, 높이 = 상하 이동, 등받이 = 힌지 기준 회전, 허리 지지 = 발광
+- 구동 중인 부위는 파랗게 깜빡이고 "조절 중" 표시, 열선·통풍은 시트 표면 색으로 표시
+- 시트 모터: 기본은 시간 기반 구동, 구동 중 `registerSeat*Position` 실제 위치가 들어오면 그 값으로 목표 도달 시 정지
+
+## 차량 외관 (`ui/Exterior.kt`)
+- 트렁크·프렁크·충전구 버튼(음성: "트렁크 열어줘") → 실제 개폐 속도로 열리고 닫히는 모션
+- 앞·뒤 창문 유리가 창문 값만큼 내려감, 충전 중이면 충전구 링이 깜빡임
+- 주행 중에는 열기 동작 차단(닫기는 허용)
+
+![motion](../02_기획서/화면시안/emulator_seat_motion.png)
+![exterior](../02_기획서/화면시안/emulator_trunk_open.png)
 
 ## 화면 구성 (Pleos 멀티 윈도우)
 - **portrait** (기본, window 1개 ≈ 841×1210): 음성 에이전트 → 실내 시각화 → 핵심 제어. 내비와 나란히 사용
@@ -38,6 +46,9 @@
 |---|---|---|
 | Vehicle 2.3.2 | `Seat.moveSeat{ForeAft,BackrestAngle,Height,LumbarForeAft}`, `setHvacSeat{Temperature,Ventilation}`, `getCurrentSeatOccupancy` | `CAR_SEATS`, `CONTROL_CAR_SEATS` |
 | Vehicle 2.3.2 | `Window.setWindowPosition`, `checkWindowPositionCapabilities` | `CAR_WINDOWS`, `CONTROL_CAR_WINDOWS` |
+| Vehicle 2.3.2 | `Seat.getCurrentSeat*Position`, `registerSeat*Position`, `checkSeat*PositionCapabilities` | `CAR_SEATS` |
+| Vehicle 2.3.2 | `Door.setDoorPosition(REAR / HOOD)`, `registerDoorPosition`, `checkDoorPositionCapabilities` | `CAR_DOORS`, `CONTROL_CAR_DOORS` |
+| Vehicle 2.3.2 | `EvBattery.setEvChargePortOpen`, `registerEvChargePortOpen` | `CAR_ENERGY` / `CONTROL_CAR_ENERGY` |
 | Vehicle 2.3.2 | `Gear.registerGearSelection` | `CAR_DRIVE` |
 | Vehicle 2.3.2 | `EvBattery.getEvBatteryStateOfCharge`, `registerEvBatteryStateOfCharge` / `setEvChargeSwitch`, `setEvChargePercentLimit` | `CAR_ENERGY` / `CONTROL_CAR_ENERGY` |
 | NaviHelper 3.0.5 | `requestRoute(RouteInfo)` | `NAVI_ROUTE` |
@@ -66,5 +77,5 @@ app/src/main/java/com/jari/agent/
   Charging.kt       충전소 데모 데이터
   Voice.kt          Pleos STT/TTS 래퍼
   MainActivity.kt   연결
-  ui/               Compose 화면 (App, Cabin3D, ChargeScreens, Theme)
+  ui/               Compose 화면 (App, Cabin3D, Exterior, ChargeScreens, Theme)
 ```

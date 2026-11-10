@@ -8,6 +8,8 @@
     <uses-permission android:name="pleos.car.permission.CONTROL_CAR_SEATS" />
     <uses-permission android:name="pleos.car.permission.CAR_WINDOWS" />
     <uses-permission android:name="pleos.car.permission.CONTROL_CAR_WINDOWS" />
+    <uses-permission android:name="pleos.car.permission.CAR_DOORS" />
+    <uses-permission android:name="pleos.car.permission.CONTROL_CAR_DOORS" />
     <uses-permission android:name="pleos.car.permission.CAR_DRIVE" />
     <uses-permission android:name="pleos.car.permission.CAR_ENERGY" />
     <uses-permission android:name="pleos.car.permission.CONTROL_CAR_ENERGY" />
@@ -21,8 +23,9 @@
         <activity
             android:name=".MainActivity"
             android:exported="true"
-            android:resizeableActivity="true">
-            <!-- 방향 미지정 = Pleos 기본 portrait(1개 window). 사용자가 넓히면 landscape 레이아웃으로 전환 -->
+            android:resizeableActivity="true"
+            android:screenOrientation="portrait">
+            <!-- portrait = Pleos 1개 window(841x1210). 사용자가 넓히면 landscape 레이아웃으로 전환 -->
             <meta-data android:name="distractionOptimized" android:value="true" />
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />

@@ -8,6 +8,11 @@ enum class WindowId(val label: String) {
     FL("운전석 창문"), FR("조수석 창문"), RL("뒷좌석 왼쪽 창문"), RR("뒷좌석 오른쪽 창문"), ROOF("선루프")
 }
 
+/** 외부 개폐부. 값은 0(닫힘)..100(완전 열림). */
+enum class Opening(val label: String) {
+    FRUNK("프렁크"), TRUNK("트렁크"), CHARGE_PORT("충전구")
+}
+
 enum class Axis(val label: String) {
     FORE_AFT("앞뒤 위치"), RECLINE("등받이"), HEIGHT("높이"), LUMBAR("허리 지지")
 }
@@ -31,6 +36,7 @@ data class CarState(
     val charging: Boolean = false,
     val chargeStart: Int = 34, // 충전 시작 시 SoC (충전량 계산용)
     val navTo: String? = null, // 길안내 중인 충전소 id
+    val openings: Map<Opening, Int> = Opening.entries.associateWith { 0 },
 ) {
     val rangeKm get() = (battery * KM_PER_PERCENT).toInt()
 
@@ -61,6 +67,7 @@ sealed interface Action {
     data class Navigate(val stationId: String) : Action
     data class Charge(val on: Boolean) : Action
     data class ChargeLimit(val percent: Int) : Action
+    data class Open(val opening: Opening, val open: Boolean) : Action
 }
 
 data class Plan(val actions: List<Action>, val speech: String)
@@ -79,6 +86,7 @@ object Agent {
         val t = raw.replace(" ", "")
         if (t.isBlank()) return Plan(emptyList(), HELP)
         if (t.has("창문", "창", "윈도우", "선루프", "썬루프", "환기", "답답")) return guard(windows(t), s)
+        openings(t)?.let { return guard(it, s) }
         charging(t, s)?.let { return it }
 
         val seats = targetSeats(t, s)
@@ -126,17 +134,36 @@ object Agent {
         return guard(plan, s)
     }
 
-    /** 안전 가드: 주행 중 운전석 자세(허리 지지 제외)를 크게 바꾸는 동작은 제거한다. 수동 조작도 이 경로를 탄다. */
+    /**
+     * 안전 가드: 주행 중 운전석 자세(허리 지지 제외)를 크게 바꾸거나 트렁크·프렁크·충전구를 여는 동작은 제거한다.
+     * 수동 조작도 이 경로를 탄다.
+     */
     fun guard(plan: Plan, s: CarState): Plan {
         if (!s.driving) return plan
-        val blocked = plan.actions.filterIsInstance<Action.Seat>().filter {
+        val seats = plan.actions.filterIsInstance<Action.Seat>().filter {
             it.seat == SeatId.DRIVER && it.axis != Axis.LUMBAR &&
                 kotlin.math.abs(it.value - s.seat(SeatId.DRIVER).pos.getValue(it.axis)) > DRIVING_LIMIT
         }
-        if (blocked.isEmpty()) return plan
-        val kept = plan.actions - blocked.toSet()
-        val note = "주행 중이라 운전석 ${blocked.map { it.axis.label }.distinct().joinToString("·")} 변경은 정차 후에 할게요."
-        return Plan(kept, if (kept.isEmpty()) note else "${plan.speech} 단, $note".trim())
+        val opens = plan.actions.filterIsInstance<Action.Open>().filter { it.open }
+        if (seats.isEmpty() && opens.isEmpty()) return plan
+        val kept = plan.actions - (seats + opens).toSet()
+        val notes = listOfNotNull(
+            if (seats.isEmpty()) null else "주행 중이라 운전석 ${seats.map { it.axis.label }.distinct().joinToString("·")} 변경은 정차 후에 할게요.",
+            if (opens.isEmpty()) null else "주행 중에는 ${opens.joinToString(", ") { it.opening.label }}${josa(opens.last().opening.label)} 열 수 없어요.",
+        ).joinToString(" ")
+        return Plan(kept, if (kept.isEmpty()) notes else "${plan.speech} 단, $notes".trim())
+    }
+
+    private fun openings(t: String): Plan? {
+        val o = when {
+            t.has("프렁크", "프론트트렁크", "앞트렁크", "보닛", "본넷") -> Opening.FRUNK
+            t.has("트렁크", "테일게이트", "뒷문") -> Opening.TRUNK
+            t.has("충전구", "충전포트", "충전단자") -> Opening.CHARGE_PORT
+            else -> return null
+        }
+        val close = t.has("닫", "잠가")
+        if (!close && !t.has("열", "오픈")) return null
+        return Plan(listOf(Action.Open(o, !close)), "${o.label}${josa(o.label)} ${if (close) "닫을게요" else "열게요"}.")
     }
 
     private fun adjust(t: String, s: CarState, seats: List<SeatId>): Plan {

@@ -64,6 +64,19 @@ class AgentTest {
         assertEquals(listOf(Action.Charge(false)), Agent.plan("충전 그만", parked).actions)
     }
 
+    @Test fun openings() {
+        assertEquals(listOf(Action.Open(Opening.TRUNK, true)), Agent.plan("트렁크 열어줘", parked).actions)
+        assertEquals(listOf(Action.Open(Opening.FRUNK, false)), Agent.plan("프렁크 닫아", parked).actions)
+        assertEquals(listOf(Action.Open(Opening.CHARGE_PORT, true)), Agent.plan("충전구 열어", parked).actions)
+    }
+
+    @Test fun drivingBlocksOpening() {
+        val p = Agent.plan("트렁크 열어줘", driving)
+        assertTrue(p.actions.isEmpty())
+        assertTrue(p.speech.contains("주행 중"))
+        assertEquals(listOf(Action.Open(Opening.TRUNK, false)), Agent.plan("트렁크 닫아줘", driving).actions)
+    }
+
     @Test fun unknown() {
         assertEquals(Agent.HELP, Agent.plan("오늘 날씨 어때", parked).speech)
     }

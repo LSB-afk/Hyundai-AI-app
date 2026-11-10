@@ -56,7 +56,7 @@ import com.jari.agent.WindowId
 import kotlin.math.roundToInt
 
 private val SUGGESTIONS = listOf(
-    "허리가 아파", "조수석 좀 눕혀줘", "너무 졸려", "충전소 찾아줘", "창문 전부 닫아줘",
+    "허리가 아파", "조수석 좀 눕혀줘", "너무 졸려", "트렁크 열어줘", "충전소 찾아줘", "창문 전부 닫아줘",
     "선루프 반만 열어", "더워", "뒷좌석 따뜻하게", "내릴게", "원래대로",
 )
 private val SIDE = listOf(WindowId.FL, WindowId.FR, WindowId.RL, WindowId.RR)
@@ -305,6 +305,8 @@ private fun HomeTab(state: CarState, ui: AgentUi, onAction: (List<Action>) -> Un
             }
         }
     }
+    SectionHeader("차량")
+    ExteriorPanel(state, onAction)
 }
 
 // ───────────────────────── 좌석 ─────────────────────────

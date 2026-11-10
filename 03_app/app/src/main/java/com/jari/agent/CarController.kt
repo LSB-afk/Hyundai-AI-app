@@ -3,15 +3,24 @@ package com.jari.agent
 import ai.pleos.playground.navi.data.RouteInfo
 import ai.pleos.playground.navi.helper.NaviHelper
 import ai.pleos.playground.vehicle.Vehicle
+import ai.pleos.playground.vehicle.api.model.area.DoorArea
 import ai.pleos.playground.vehicle.api.model.area.SeatArea
 import ai.pleos.playground.vehicle.api.model.area.WindowArea
 import ai.pleos.playground.vehicle.api.model.capability.AreaBounds
+import ai.pleos.playground.vehicle.api.model.capability.CapabilityConfig
+import ai.pleos.playground.vehicle.constant.area.DoorValue
 import ai.pleos.playground.vehicle.constant.area.SeatValue
 import ai.pleos.playground.vehicle.constant.area.WindowValue
 import ai.pleos.playground.vehicle.constant.control.MoveControl
 import ai.pleos.playground.vehicle.constant.control.VehicleGear
+import ai.pleos.playground.vehicle.listener.DoorPositionListener
 import ai.pleos.playground.vehicle.listener.EvBatteryStateOfChargeListener
+import ai.pleos.playground.vehicle.listener.EvChargePortOpenListener
 import ai.pleos.playground.vehicle.listener.GearSelectionListener
+import ai.pleos.playground.vehicle.listener.SeatBackrestAnglePositionListener
+import ai.pleos.playground.vehicle.listener.SeatForeAftPositionListener
+import ai.pleos.playground.vehicle.listener.SeatHeightPositionListener
+import ai.pleos.playground.vehicle.listener.SeatLumbarForeAftPositionListener
 import android.content.Context
 import android.util.Log
 import kotlinx.coroutines.CoroutineScope
@@ -20,8 +29,10 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
 
 private val SEAT_AREA = mapOf(
     SeatId.DRIVER to SeatArea(SeatValue.ROW_1_LEFT),
@@ -36,6 +47,10 @@ private val WINDOW_AREA = mapOf(
     WindowId.RR to WindowArea(WindowValue.ROW_2_RIGHT),
     WindowId.ROOF to WindowArea(WindowValue.ROOF_TOP_1),
 )
+private val DOOR_AREA = mapOf(
+    Opening.TRUNK to DoorArea(DoorValue.REAR),
+    Opening.FRUNK to DoorArea(DoorValue.HOOD),
+)
 
 /**
  * Pleos Vehicle SDK 브리지. 서비스가 없으면(일반 에뮬레이터) 같은 상태 머신으로 시뮬레이션만 한다.
@@ -47,6 +62,10 @@ class CarController(context: Context, private val scope: CoroutineScope) {
 
     private val jobs = mutableMapOf<Any, Job>()
     private val windowBounds = mutableMapOf<WindowId, AreaBounds<Int>>()
+    private val doorBounds = mutableMapOf<Opening, AreaBounds<Int>>()
+    /** 구동 중 실제 위치가 들어온 시트 축. 이후로는 시간 계산 대신 실제 위치를 따른다. */
+    private val reported = java.util.concurrent.ConcurrentHashMap.newKeySet<Pair<SeatId, Axis>>()
+    private val unregister = mutableListOf<Vehicle.() -> Unit>()
     private val vehicle: Vehicle? = runCatching { Vehicle(context).apply { initialize() } }.onFailure(::fail).getOrNull()
 
     private val gearListener = object : GearSelectionListener {
@@ -58,6 +77,11 @@ class CarController(context: Context, private val scope: CoroutineScope) {
 
     private val socListener = object : EvBatteryStateOfChargeListener {
         override fun onEvBatteryStateOfChargeUpdated(soc: Int?) = onSoc(soc)
+        override fun onFailed(e: Exception) = fail(e)
+    }
+
+    private val portListener = object : EvChargePortOpenListener {
+        override fun onEvChargePortOpenUpdated(open: Boolean?) = setOpening(Opening.CHARGE_PORT, if (open == true) 100 else 0)
         override fun onFailed(e: Exception) = fail(e)
     }
 
@@ -75,8 +99,98 @@ class CarController(context: Context, private val scope: CoroutineScope) {
             }
             getGear().getCurrentGearSelectionState(::onGear, ::fail)
             getGear().registerGearSelection(gearListener)
+            getEvBattery().isEvChargePortOpen({ open -> setOpening(Opening.CHARGE_PORT, if (open == true) 100 else 0) }, ::fail)
+            getEvBattery().registerEvChargePortOpen(portListener)
+            unregister += { getEvBattery().unregisterEvChargePortOpen(portListener) }
+            getDoor().checkDoorPositionCapabilities({ map: Map<DoorArea, AreaBounds<Int>> ->
+                map.forEach { (area, b) -> DOOR_AREA.entries.find { it.value == area }?.let { watchDoor(it.key, b) } }
+            }, ::fail)
+            Axis.entries.forEach(::watchSeat)
         }
     }
+
+    /** 트렁크/프렁크 실제 위치를 받아 화면에 반영 */
+    private fun watchDoor(o: Opening, b: AreaBounds<Int>) = sdk {
+        doorBounds[o] = b
+        val area = DOOR_AREA.getValue(o)
+        val l = object : DoorPositionListener {
+            override fun onPositionUpdated(raw: Int?) { if (raw != null) setOpening(o, percent(raw, b)) }
+            override fun onFailed(e: Exception) = fail(e)
+        }
+        getDoor().getCurrentDoorPosition(area, { raw -> if (raw != null) setOpening(o, percent(raw, b)) }, ::fail)
+        getDoor().registerDoorPosition(area, l)
+        unregister += { getDoor().unregisterDoorPosition(area, l) }
+    }
+
+    /** 시트 축별 위치 범위를 확인하고, 되는 축은 실제 위치를 구독한다. */
+    private fun watchSeat(axis: Axis) = sdk {
+        val onCaps = { _: CapabilityConfig, map: Map<SeatArea, AreaBounds<Int>> ->
+            map.forEach { (area, b) ->
+                val id = SEAT_AREA.entries.find { it.value == area }?.key ?: return@forEach
+                subscribeSeat(id, axis, b)
+            }
+        }
+        with(getSeat()) {
+            when (axis) {
+                Axis.FORE_AFT -> checkSeatForeAftPositionCapabilities(onCaps, ::fail)
+                Axis.RECLINE -> checkSeatBackrestAnglePositionCapabilities(onCaps, ::fail)
+                Axis.HEIGHT -> checkSeatHeightPositionCapabilities(onCaps, ::fail)
+                Axis.LUMBAR -> checkSeatLumbarForeAftPositionCapabilities(onCaps, ::fail)
+            }
+        }
+    }
+
+    private fun subscribeSeat(id: SeatId, axis: Axis, b: AreaBounds<Int>) = sdk {
+        val area = SEAT_AREA.getValue(id)
+        val on = { raw: Int? -> if (raw != null) onSeatPos(id, axis, percent(raw, b)) }
+        with(getSeat()) {
+            when (axis) {
+                Axis.FORE_AFT -> {
+                    getCurrentSeatForeAftPosition(area, on, ::fail)
+                    val l = object : SeatForeAftPositionListener {
+                        override fun onSeatForeAftPositionUpdated(v: Int?) = on(v)
+                        override fun onFailed(e: Exception) = fail(e)
+                    }
+                    registerSeatForeAftPosition(area, l)
+                    unregister += { getSeat().unregisterSeatForeAftPosition(area, l) }
+                }
+                Axis.RECLINE -> {
+                    getCurrentSeatBackrestAnglePosition(area, on, ::fail)
+                    val l = object : SeatBackrestAnglePositionListener {
+                        override fun onSeatBackrestAnglePositionUpdated(v: Int?) = on(v)
+                        override fun onFailed(e: Exception) = fail(e)
+                    }
+                    registerSeatBackrestAnglePosition(area, l)
+                    unregister += { getSeat().unregisterSeatBackrestAnglePosition(area, l) }
+                }
+                Axis.HEIGHT -> {
+                    getCurrentSeatHeightPosition(area, on, ::fail)
+                    val l = object : SeatHeightPositionListener {
+                        override fun onSeatHeightPositionUpdated(v: Int?) = on(v)
+                        override fun onFailed(e: Exception) = fail(e)
+                    }
+                    registerSeatHeightPosition(area, l)
+                    unregister += { getSeat().unregisterSeatHeightPosition(area, l) }
+                }
+                Axis.LUMBAR -> {
+                    getCurrentSeatLumbarForeAftPosition(area, on, ::fail)
+                    val l = object : SeatLumbarForeAftPositionListener {
+                        override fun onSeatLumbarForeAftPositionUpdated(v: Int?) = on(v)
+                        override fun onFailed(e: Exception) = fail(e)
+                    }
+                    registerSeatLumbarForeAftPosition(area, l)
+                    unregister += { getSeat().unregisterSeatLumbarForeAftPosition(area, l) }
+                }
+            }
+        }
+    }
+
+    private fun onSeatPos(id: SeatId, axis: Axis, p: Int) {
+        if (jobs[id to axis]?.isActive == true) reported += id to axis
+        _state.update { it.withSeat(id) { copy(pos = pos + (axis to p)) } }
+    }
+
+    private fun setOpening(o: Opening, p: Int) = _state.update { it.copy(openings = it.openings + (o to p)) }
 
     fun execute(actions: List<Action>) = actions.forEach { a ->
         when (a) {
@@ -95,6 +209,24 @@ class CarController(context: Context, private val scope: CoroutineScope) {
             is Action.ChargeLimit -> {
                 _state.update { it.copy(chargeLimit = a.percent) }
                 sdk { getEvBattery().setEvChargePercentLimit(a.percent.toFloat(), { }, ::fail) }
+            }
+            is Action.Open -> open(a)
+        }
+    }
+
+    /**
+     * 트렁크/프렁크 = Door 절대 위치, 충전구 = EvBattery 스위치. 화면은 목표값으로 바로 바꾸고
+     * UI가 실제 개폐 속도로 애니메이션한다. 실차는 리스너가 실제 위치로 덮어쓴다.
+     */
+    private fun open(a: Action.Open) {
+        setOpening(a.opening, if (a.open) 100 else 0)
+        sdk {
+            when (a.opening) {
+                Opening.CHARGE_PORT -> getEvBattery().setEvChargePortOpen(a.open, { }, ::fail)
+                else -> {
+                    val b = doorBounds[a.opening] ?: AreaBounds(0, 100)
+                    getDoor().setDoorPosition(DOOR_AREA.getValue(a.opening), if (a.open) b.maxValue else b.minValue, { _, _ -> }, ::fail)
+                }
             }
         }
     }
@@ -137,6 +269,7 @@ class CarController(context: Context, private val scope: CoroutineScope) {
         sdk {
             getGear().unregisterGearSelection(gearListener)
             getEvBattery().unregisterEvBatteryStateOfCharge(socListener)
+            unregister.forEach { it() }
         }
         runCatching { vehicle?.release() }
         runCatching { navi?.release() }
@@ -147,8 +280,10 @@ class CarController(context: Context, private val scope: CoroutineScope) {
     }
 
     /**
-     * 시트 모터는 위치 지정이 아니라 FORWARD/BACKWARD/STOP 방식이라, 목표까지 시간으로 구동한 뒤 STOP.
-     * ponytail: 개방 루프 타이밍. 실차에서 MS_PER_PERCENT 보정 필요, 위치 조회 API로 폐루프 전환 가능.
+     * 시트 모터는 위치 지정이 아니라 FORWARD/BACKWARD/STOP 방식.
+     * 기본은 시간으로 구동(개방 루프). 구동 중 실제 위치가 들어오면 그때부터 실제 위치가 목표에 닿을 때 STOP(폐루프).
+     * (Pleos 에뮬레이터는 위치 범위는 주지만 모터를 시뮬레이션하지 않아 위치가 변하지 않는다)
+     * ponytail: 원시 위치값의 증가 방향 = 우리 값 증가 방향으로 가정. 실차에서 반대면 percent()에서 뒤집기.
      */
     private fun moveSeat(a: Action.Seat) {
         val key = a.seat to a.axis
@@ -159,18 +294,26 @@ class CarController(context: Context, private val scope: CoroutineScope) {
         // 등받이는 값이 클수록 눕힘 = BACKWARD. 나머지는 값 증가 = FORWARD (실차에서 방향 확인 필요)
         val up = if (a.axis == Axis.RECLINE) MoveControl.BACKWARD else MoveControl.FORWARD
         val down = if (up == MoveControl.FORWARD) MoveControl.BACKWARD else MoveControl.FORWARD
+        reported -= key
         jobs[key] = scope.launch {
             seatMotor(a.seat, a.axis, if (dir > 0) up else down)
             try {
                 var p = from
-                while (p != a.value) {
+                while (p != a.value && key !in reported) {
                     delay(MS_PER_PERCENT)
                     p += dir
                     val v = p
                     _state.update { it.withSeat(a.seat) { copy(pos = pos + (a.axis to v)) } }
                 }
+                if (key in reported) {
+                    // 방향이 반대로 매핑돼 있어도 무한 구동하지 않도록 예상 시간의 3배에서 끊는다
+                    withTimeoutOrNull(kotlin.math.abs(a.value - from) * MS_PER_PERCENT * 3 + 1000) {
+                        state.first { val q = it.seat(a.seat).pos.getValue(a.axis); if (dir > 0) q >= a.value else q <= a.value }
+                    }
+                }
             } finally {
                 seatMotor(a.seat, a.axis, MoveControl.STOP)
+                reported -= key
             }
         }
     }
@@ -206,6 +349,9 @@ class CarController(context: Context, private val scope: CoroutineScope) {
             }
         }
     }
+
+    private fun percent(raw: Int, b: AreaBounds<Int>) =
+        if (b.maxValue == b.minValue) 0 else ((raw - b.minValue) * 100 / (b.maxValue - b.minValue)).coerceIn(0, 100)
 
     private inline fun sdk(block: Vehicle.() -> Unit) {
         val v = vehicle ?: return
