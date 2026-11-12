@@ -50,6 +50,7 @@ import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.jari.agent.Axis
@@ -323,19 +324,24 @@ private fun WindowSummary(state: CarState) {
 
 /** 선택 시트의 현재 값 (작동 중인 축은 파랗게) */
 @Composable
-fun SeatAxisChips(label: String, a: SeatAnim, modifier: Modifier = Modifier) = Row(modifier, verticalAlignment = Alignment.CenterVertically) {
-    Text(label, fontSize = 15.sp, fontWeight = FontWeight.SemiBold, color = Ink, modifier = Modifier.weight(1f))
-    listOf(
-        "등받이 ${(8f + 45f * a[Axis.RECLINE] / 100f).toInt()}°" to Axis.RECLINE,
-        "앞뒤 ${a[Axis.FORE_AFT].toInt()}%" to Axis.FORE_AFT,
-        "높이 ${a[Axis.HEIGHT].toInt()}%" to Axis.HEIGHT,
-        "허리 ${a[Axis.LUMBAR].toInt()}%" to Axis.LUMBAR,
-    ).forEach { (t, axis) ->
-        val on = axis in a.moving
-        Text(
-            t, fontSize = 14.sp, fontWeight = FontWeight.Medium, color = if (on) Color.White else Ink,
-            modifier = Modifier.padding(start = 6.dp).clip(RoundedCornerShape(50)).background(if (on) Blue else Bg)
-                .padding(horizontal = 10.dp, vertical = 5.dp),
-        )
+// 좁은 화면(세로)은 좌석 이름까지 한 줄에 안 들어가 칩이 줄바꿈됐다 → 이름은 빼고(아래 좌석 선택 칩·파란 시트로 표시됨) 칩 4개를 같은 폭으로 한 줄에
+fun SeatAxisChips(label: String, a: SeatAnim, modifier: Modifier = Modifier) = BoxWithConstraints(modifier) {
+    val compact = maxWidth < 420.dp
+    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+        if (!compact) Text(label, fontSize = 15.sp, fontWeight = FontWeight.SemiBold, color = Ink, maxLines = 1, modifier = Modifier.weight(1f))
+        listOf(
+            "등받이 ${(8f + 45f * a[Axis.RECLINE] / 100f).toInt()}°" to Axis.RECLINE,
+            "앞뒤 ${a[Axis.FORE_AFT].toInt()}%" to Axis.FORE_AFT,
+            "높이 ${a[Axis.HEIGHT].toInt()}%" to Axis.HEIGHT,
+            "허리 ${a[Axis.LUMBAR].toInt()}%" to Axis.LUMBAR,
+        ).forEach { (t, axis) ->
+            val on = axis in a.moving
+            Text(
+                t, fontSize = if (compact) 13.sp else 14.sp, fontWeight = FontWeight.Medium, color = if (on) Color.White else Ink,
+                softWrap = false, textAlign = TextAlign.Center,
+                modifier = (if (compact) Modifier.weight(1f) else Modifier).clip(RoundedCornerShape(50)).background(if (on) Blue else Bg)
+                    .padding(horizontal = if (compact) 4.dp else 10.dp, vertical = 5.dp),
+            )
+        }
     }
 }

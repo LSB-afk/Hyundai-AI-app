@@ -39,6 +39,8 @@ import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.intl.LocaleList
+import androidx.compose.ui.text.style.LineBreak
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.platform.LocalDensity
@@ -51,6 +53,7 @@ import com.jari.agent.AgentUi
 import com.jari.agent.Axis
 import com.jari.agent.CarState
 import com.jari.agent.STATIONS
+import com.jari.agent.Sim
 import com.jari.agent.SeatId
 import com.jari.agent.WindowId
 import kotlin.math.roundToInt
@@ -70,15 +73,17 @@ fun App(
     onAction: (List<Action>) -> Unit,
     onToggleDriving: () -> Unit,
     initialTab: Int = 0,
+    onSim: (Sim) -> Unit = {},
 ) {
     // Pleos 앱 영역은 높이 1210px(mdpi) 고정, 폭은 1개 window(portrait ≈840) 또는 2개(landscape ≈1680).
     // 높이 920dp 기준으로 키워 두 모드의 글자 크기를 같게 유지하고, 폭으로 레이아웃을 고른다.
-    BoxWithConstraints(Modifier.fillMaxSize()) {
+    // Android 15(targetSdk 35)는 앱이 상태바 뒤까지 그려진다 → 상태바·내비바 영역을 비켜야 상단 칩이 눌린다
+    BoxWithConstraints(Modifier.fillMaxSize().background(Bg).safeDrawingPadding()) {
         val d = LocalDensity.current
         val scale = (maxHeight.value / 920f).coerceIn(1f, 2f)
         val wide = maxWidth.value / scale >= 1000f
         CompositionLocalProvider(LocalDensity provides Density(d.density * scale, d.fontScale)) {
-            AppContent(state, ui, onAsk, onMic, onAction, onToggleDriving, initialTab, wide)
+            AppContent(state, ui, onAsk, onMic, onAction, onToggleDriving, onSim, initialTab, wide)
         }
     }
 }
@@ -91,10 +96,13 @@ private fun AppContent(
     onMic: () -> Unit,
     onAction: (List<Action>) -> Unit,
     onToggleDriving: () -> Unit,
+    onSim: (Sim) -> Unit,
     initialTab: Int,
     wide: Boolean,
 ) {
     var tab by rememberSaveable { mutableIntStateOf(initialTab) }
+    var simOpen by rememberSaveable { mutableStateOf(false) }
+    val onSimChip = { if (!state.live) simOpen = !simOpen }
     var selected by rememberSaveable { mutableStateOf(SeatId.DRIVER) }
     var stationId by rememberSaveable { mutableStateOf(state.navTo ?: STATIONS.first().id) }
     var autoRest by rememberSaveable { mutableStateOf(true) }
@@ -111,8 +119,8 @@ private fun AppContent(
     val onSeatTap: (SeatId) -> Unit = { selected = it; tab = 1 }
     @Composable
     fun ColumnScope.tabContent() = when (tab) {
-        0 -> HomeTab(state, ui, onAction, onAsk, onToggleDriving)
-        1 -> SeatsTab(state, selected, { selected = it }, onAction, onAsk)
+        0 -> HomeTab(state, ui, wide, onAction, onAsk, onToggleDriving)
+        1 -> SeatsTab(state, selected, wide, { selected = it }, onAction, onAsk)
         2 -> WindowsTab(state, onAction, onAsk)
         else -> ChargeTab(state, stationId, { stationId = it }, autoRest, { autoRest = it }, onAction, onAsk)
     }
@@ -121,12 +129,13 @@ private fun AppContent(
             // landscape: 차량 시각화(좌) + 에이전트·제어(우)
             Row(Modifier.fillMaxSize().padding(24.dp), horizontalArrangement = Arrangement.spacedBy(20.dp)) {
                 val left = Modifier.weight(0.42f).fillMaxHeight()
-                if (tab == 3) MapCard(state, stationId, { stationId = it }, left)
-                else HeroCard(state, selected, onSeatTap, onToggleDriving, left)
+                if (tab == 3) MapCard(state, stationId, { stationId = it }, onAction, left)
+                else HeroCard(state, selected, onSeatTap, onToggleDriving, simOpen, onSimChip, left)
                 Column(
                     Modifier.weight(0.58f).fillMaxHeight().verticalScroll(rememberScrollState()),
                     verticalArrangement = Arrangement.spacedBy(16.dp),
                 ) {
+                    if (simOpen) SimPanel(state, onToggleDriving, onSim) { simOpen = false }
                     AgentCard(ui, onAsk, onMic, typing = !state.driving)
                     tabContent()
                     Spacer(Modifier.height(96.dp))
@@ -138,7 +147,8 @@ private fun AppContent(
                 Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(20.dp),
                 verticalArrangement = Arrangement.spacedBy(14.dp),
             ) {
-                TopBar(state, onToggleDriving)
+                TopBar(state, onToggleDriving, simOpen, onSimChip)
+                if (simOpen) SimPanel(state, onToggleDriving, onSim) { simOpen = false }
                 AgentCard(ui, onAsk, onMic, typing = !state.driving)
                 val anims = rememberSeatAnims(state)
                 when (tab) {
@@ -147,7 +157,8 @@ private fun AppContent(
                         Cabin3D(state, anims, selected, onSeatTap, Modifier.fillMaxWidth().height(360.dp), side = true)
                         SeatAxisChips(selected.label, anims.getValue(selected), Modifier.fillMaxWidth().padding(top = 8.dp))
                     }
-                    else -> MapCard(state, stationId, { stationId = it }, Modifier.fillMaxWidth().height(320.dp))
+                    // 320dp에선 핀이 내 차·하단 배터리 표시와 겹쳤다
+                    else -> MapCard(state, stationId, { stationId = it }, onAction, Modifier.fillMaxWidth().height(400.dp))
                 }
                 tabContent()
                 Spacer(Modifier.height(96.dp))
@@ -160,9 +171,12 @@ private fun AppContent(
 // ───────────────────────── 좌측 히어로 ─────────────────────────
 
 @Composable
-private fun HeroCard(state: CarState, selected: SeatId, onSeatTap: (SeatId) -> Unit, onToggleDriving: () -> Unit, modifier: Modifier) =
+private fun HeroCard(
+    state: CarState, selected: SeatId, onSeatTap: (SeatId) -> Unit, onToggleDriving: () -> Unit,
+    simOpen: Boolean, onSimChip: () -> Unit, modifier: Modifier,
+) =
     Panel(modifier) {
-        TopBar(state, onToggleDriving)
+        TopBar(state, onToggleDriving, simOpen, onSimChip)
         val anims = rememberSeatAnims(state)
         Cabin3D(state, anims, selected, onSeatTap, Modifier.weight(1f).fillMaxWidth().padding(vertical = 8.dp))
         SeatAxisChips(selected.label, anims.getValue(selected), Modifier.fillMaxWidth().padding(bottom = 10.dp))
@@ -172,7 +186,7 @@ private fun HeroCard(state: CarState, selected: SeatId, onSeatTap: (SeatId) -> U
     }
 
 @Composable
-private fun TopBar(state: CarState, onToggleDriving: () -> Unit) = Column {
+private fun TopBar(state: CarState, onToggleDriving: () -> Unit, simOpen: Boolean, onSimChip: () -> Unit) = Column {
     Row(verticalAlignment = Alignment.CenterVertically) {
         Icon(Icons.Rounded.AutoAwesome, null, tint = Blue, modifier = Modifier.size(24.dp))
         Spacer(Modifier.width(8.dp))
@@ -180,10 +194,63 @@ private fun TopBar(state: CarState, onToggleDriving: () -> Unit) = Column {
         Spacer(Modifier.weight(1f))
         Chip(if (state.driving) "D  주행 중" else "P  정차", active = state.driving, onClick = onToggleDriving)
         Spacer(Modifier.width(8.dp))
-        Chip(if (state.live) "Pleos 연결" else "시뮬레이션", active = false)
+        // 시뮬레이션 칩을 누르면 기어·배터리·탑승 좌석을 바꾸는 패널이 열린다 (실차 연결 시에는 표시만)
+        Chip(if (state.live) "Pleos 연결" else "시뮬레이션", active = simOpen, onClick = if (state.live) null else onSimChip)
     }
     Text("AI 좌석 · 창문 에이전트", color = Sub, fontSize = 14.sp, modifier = Modifier.padding(top = 4.dp))
 }
+
+// ───────────────────────── 시뮬레이션 패널 ─────────────────────────
+
+/** Pleos 차량 서비스가 없을 때 차량 신호(기어·배터리·탑승 좌석)를 직접 바꿔 보는 데모용 패널 */
+@Composable
+private fun SimPanel(state: CarState, onToggleDriving: () -> Unit, onSim: (Sim) -> Unit, onClose: () -> Unit) = Panel {
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Text("시뮬레이션", fontSize = 18.sp, fontWeight = FontWeight.Bold, color = Ink, modifier = Modifier.weight(1f))
+        Text("닫기", color = Blue, fontSize = 15.sp, fontWeight = FontWeight.Medium, modifier = Modifier.clickable(onClick = onClose).padding(4.dp))
+    }
+    Text("차량 서비스가 없어 앱이 차량 신호를 흉내 내요. 값을 바꾸면 JARI가 실제 차처럼 반응해요.", color = Sub, fontSize = 14.sp)
+
+    SimLabel("기어")
+    Row(Modifier.fillMaxWidth().clip(RoundedCornerShape(16.dp)).background(Bg).padding(4.dp)) {
+        listOf(false to "P  정차", true to "D  주행").forEach { (driving, label) ->
+            val on = state.driving == driving
+            Box(
+                Modifier.weight(1f).clip(RoundedCornerShape(12.dp)).background(if (on) Blue else Color.Transparent)
+                    .clickable { if (!on) onToggleDriving() }.padding(vertical = 12.dp),
+                contentAlignment = Alignment.Center,
+            ) { Text(label, color = if (on) Color.White else Ink, fontSize = 15.sp, fontWeight = FontWeight.SemiBold) }
+        }
+    }
+
+    var drag by remember { mutableStateOf<Float?>(null) }
+    val battery = drag?.roundToInt() ?: state.battery
+    SimLabel("배터리  $battery%")
+    Slider(
+        value = drag ?: state.battery.toFloat(),
+        onValueChange = { drag = it },
+        onValueChangeFinished = { drag?.let { onSim(Sim.Battery(it.roundToInt())) }; drag = null },
+        valueRange = 0f..100f,
+        colors = SliderDefaults.colors(thumbColor = Blue, activeTrackColor = Blue, inactiveTrackColor = Line),
+    )
+    Text("주행 중에 20% 이하로 내리면 JARI가 먼저 충전소를 안내해요.", color = Sub, fontSize = 13.sp)
+
+    SimLabel("탑승 좌석")
+    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        listOf(SeatId.DRIVER to "운전석", SeatId.PASSENGER to "조수석", SeatId.REAR_LEFT to "뒤 왼쪽", SeatId.REAR_RIGHT to "뒤 오른쪽").forEach { (id, name) ->
+            val on = state.seat(id).occupied
+            Box(
+                Modifier.weight(1f).clip(RoundedCornerShape(12.dp)).background(if (on) Navy else Bg)
+                    .clickable { onSim(Sim.Occupied(id, !on)) }.padding(vertical = 12.dp),
+                contentAlignment = Alignment.Center,
+            ) { Text(name, color = if (on) Color.White else Sub, fontSize = 14.sp, fontWeight = FontWeight.Medium, maxLines = 1) }
+        }
+    }
+}
+
+@Composable
+private fun SimLabel(text: String) =
+    Text(text, fontSize = 15.sp, fontWeight = FontWeight.SemiBold, color = Ink, modifier = Modifier.padding(top = 16.dp, bottom = 8.dp))
 
 // ───────────────────────── AI 에이전트 카드 ─────────────────────────
 
@@ -202,13 +269,21 @@ private fun AgentCard(ui: AgentUi, onAsk: (String) -> Unit, onMic: () -> Unit, t
                 color = if (ui.listening) Blue else Sub, fontSize = 14.sp, maxLines = 1, overflow = TextOverflow.Ellipsis,
             )
             Spacer(Modifier.height(4.dp))
-            Text(ui.reply, color = Ink, fontSize = 19.sp, fontWeight = FontWeight.SemiBold, lineHeight = 26.sp, maxLines = 3)
+            // 어절 단위로 끊고 줄 길이를 고르게(마지막 줄에 "요."만 남지 않게). 본문 기본 자간(0.5sp)은 빼서 두 줄에 들어가게
+            Text(
+                sentenceLines(ui.reply), color = Ink, fontSize = 19.sp, fontWeight = FontWeight.SemiBold, lineHeight = 26.sp, // 줄 수 제한 없음: 긴 답변이 문장 중간에서 잘리지 않게
+                style = TextStyle(
+                    localeList = LocaleList("ko-KR"),
+                    lineBreak = LineBreak(LineBreak.Strategy.Balanced, LineBreak.Strictness.Normal, LineBreak.WordBreak.Phrase),
+                ),
+            )
         }
     }
     Spacer(Modifier.height(16.dp))
     if (typing) {
         var text by remember { mutableStateOf("") }
         val send = { if (text.isNotBlank()) { onAsk(text); text = "" } }
+        // 입력창과 보내기 버튼을 같은 높이(56dp)로. 버튼은 종이비행기 아이콘만 (글자를 쓰면 진한 파랑)
         Row(verticalAlignment = Alignment.CenterVertically) {
             BasicTextField(
                 value = text,
@@ -217,20 +292,20 @@ private fun AgentCard(ui: AgentUi, onAsk: (String) -> Unit, onMic: () -> Unit, t
                 textStyle = TextStyle(fontSize = 15.sp, color = Ink),
                 keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
                 keyboardActions = KeyboardActions(onSend = { send() }),
-                modifier = Modifier.weight(1f).clip(RoundedCornerShape(16.dp)).background(Bg).padding(horizontal = 18.dp, vertical = 15.dp),
+                modifier = Modifier.weight(1f).height(56.dp).clip(RoundedCornerShape(16.dp)).background(Bg).padding(horizontal = 18.dp),
                 decorationBox = { inner ->
-                    if (text.isEmpty()) Text("직접 입력해도 돼요  (예: 뒷좌석 왼쪽 따뜻하게)", color = Sub, fontSize = 15.sp)
-                    inner()
+                    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.CenterStart) {
+                        if (text.isEmpty()) Text("직접 입력 · 예) 뒷좌석 따뜻하게", color = Sub, fontSize = 15.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        inner()
+                    }
                 },
             )
             Spacer(Modifier.width(10.dp))
-            Row(
-                Modifier.clip(RoundedCornerShape(16.dp)).background(Blue).clickable(onClick = send).padding(horizontal = 22.dp, vertical = 14.dp),
-                verticalAlignment = Alignment.CenterVertically,
+            Box(
+                Modifier.size(56.dp).clip(RoundedCornerShape(16.dp)).background(if (text.isBlank()) BlueSoft else Blue).clickable(onClick = send),
+                contentAlignment = Alignment.Center,
             ) {
-                Icon(Icons.AutoMirrored.Rounded.Send, null, tint = Color.White, modifier = Modifier.size(18.dp))
-                Spacer(Modifier.width(6.dp))
-                Text("보내기", color = Color.White, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
+                Icon(Icons.AutoMirrored.Rounded.Send, "보내기", tint = if (text.isBlank()) Blue else Color.White, modifier = Modifier.size(22.dp))
             }
         }
     } else {
@@ -262,49 +337,64 @@ internal fun MicOrb(listening: Boolean, onClick: () -> Unit, size: Dp) {
 // ───────────────────────── 홈 ─────────────────────────
 
 @Composable
-private fun HomeTab(state: CarState, ui: AgentUi, onAction: (List<Action>) -> Unit, onAsk: (String) -> Unit, onToggleDriving: () -> Unit) {
+private fun HomeTab(state: CarState, ui: AgentUi, wide: Boolean, onAction: (List<Action>) -> Unit, onAsk: (String) -> Unit, onToggleDriving: () -> Unit) {
     SectionHeader("빠른 제어", "전체 초기화") { onAsk("모든 좌석 원래대로") }
     val d = state.seat(SeatId.DRIVER)
     val open = SIDE.count { state.windows.getValue(it) > 0 }
     val roof = state.windows.getValue(WindowId.ROOF)
-    Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-        QuickTile("운전석 열선", level(d.heat), Icons.Rounded.LocalFireDepartment, d.heat > 0) {
-            onAction(listOf(Action.Heat(SeatId.DRIVER, (d.heat + 1) % 4)))
-        }
-        QuickTile("운전석 통풍", level(d.vent), Icons.Rounded.AcUnit, d.vent > 0) {
-            onAction(listOf(Action.Vent(SeatId.DRIVER, (d.vent + 1) % 4)))
-        }
-        QuickTile("창문", if (open == 0) "모두 닫힘" else "${open}개 열림", Icons.Rounded.Window, open > 0) {
-            onAction(SIDE.map { Action.Window(it, if (open > 0) 0 else 20) })
-        }
-        QuickTile("선루프", if (roof == 0) "닫힘" else "$roof% 열림", Icons.Rounded.WbSunny, roof > 0) {
-            onAction(listOf(Action.Window(WindowId.ROOF, if (roof > 0) 0 else 100)))
-        }
-    }
-    Row(Modifier.height(IntrinsicSize.Min), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+    TileRows(
+        wide,
+        tiles = listOf(
+            { QuickTile("운전석 열선", level(d.heat), Icons.Rounded.LocalFireDepartment, d.heat > 0) {
+                onAction(listOf(Action.Heat(SeatId.DRIVER, (d.heat + 1) % 4)))
+            } },
+            { QuickTile("운전석 통풍", level(d.vent), Icons.Rounded.AcUnit, d.vent > 0) {
+                onAction(listOf(Action.Vent(SeatId.DRIVER, (d.vent + 1) % 4)))
+            } },
+            { QuickTile("창문", if (open == 0) "모두 닫힘" else "${open}개 열림", Icons.Rounded.Window, open > 0) {
+                onAction(SIDE.map { Action.Window(it, if (open > 0) 0 else 20) })
+            } },
+            { QuickTile("선루프", if (roof == 0) "닫힘" else "$roof% 열림", Icons.Rounded.WbSunny, roof > 0) {
+                onAction(listOf(Action.Window(WindowId.ROOF, if (roof > 0) 0 else 100)))
+            } },
+        ),
+    )
+    @Composable
+    fun RowScope.statusPanels() {
         Panel(Modifier.weight(1f).fillMaxHeight(), onClick = onToggleDriving) {
             IconBadge(Icons.Rounded.Speed)
             Spacer(Modifier.height(12.dp))
             Text(if (state.driving) "D" else "P", fontSize = 40.sp, fontWeight = FontWeight.Bold, color = Ink)
-            Text(if (state.driving) "주행 중 · 안전 제한 적용" else "정차 중 · 모든 조절 가능", color = Sub, fontSize = 14.sp)
+            Text(if (state.driving) "주행 중\n안전 제한 적용" else "정차 중\n모든 조절 가능", color = Sub, fontSize = 14.sp)
         }
         Panel(Modifier.weight(1f).fillMaxHeight()) {
             IconBadge(Icons.Rounded.Groups)
             Spacer(Modifier.height(12.dp))
-            Text("${state.seats.values.count { it.occupied }}명", fontSize = 40.sp, fontWeight = FontWeight.Bold, color = Ink)
-            Text("탑승 인원 · 시트 센서", color = Sub, fontSize = 14.sp)
-        }
-        Panel(Modifier.weight(1.5f).fillMaxHeight()) {
-            Text("최근 명령", fontSize = 16.sp, fontWeight = FontWeight.SemiBold, color = Ink)
-            Spacer(Modifier.height(8.dp))
-            if (ui.history.isEmpty()) Text("아직 명령이 없어요. 마이크를 눌러 말해 보세요.", color = Sub, fontSize = 14.sp)
-            ui.history.take(3).forEach { (q, a) ->
-                Text("“$q”", color = Blue, fontSize = 14.sp, fontWeight = FontWeight.Medium, maxLines = 1)
-                Text(a, color = Ink, fontSize = 14.sp, maxLines = 2, overflow = TextOverflow.Ellipsis)
-                Spacer(Modifier.height(8.dp))
+            // 큰 글자에 한글("명")이 섞이면 대체 폰트 때문에 줄이 높아져 옆 카드 "P"와 높이가 어긋난다 → 숫자만 크게, 단위는 기준선 맞춤
+            Row {
+                Text("${state.seats.values.count { it.occupied }}", Modifier.alignByBaseline(), fontSize = 40.sp, fontWeight = FontWeight.Bold, color = Ink)
+                Text("명", Modifier.alignByBaseline().padding(start = 4.dp), fontSize = 20.sp, fontWeight = FontWeight.Bold, color = Ink)
             }
+            Text("탑승 인원\n시트 센서", color = Sub, fontSize = 14.sp)
         }
     }
+    @Composable
+    fun recentPanel(modifier: Modifier) = Panel(modifier) {
+        Text("최근 명령", fontSize = 16.sp, fontWeight = FontWeight.SemiBold, color = Ink)
+        Spacer(Modifier.height(8.dp))
+        if (ui.history.isEmpty()) Text("아직 명령이 없어요. 마이크를 눌러 말해 보세요.", color = Sub, fontSize = 14.sp)
+        ui.history.take(3).forEach { (q, a) ->
+            Text("“$q”", color = Blue, fontSize = 14.sp, fontWeight = FontWeight.Medium, maxLines = 1)
+            Text(sentenceLines(a), color = Ink, fontSize = 14.sp, maxLines = 3, overflow = TextOverflow.Ellipsis)
+            Spacer(Modifier.height(8.dp))
+        }
+    }
+    // portrait는 폭이 좁아 세 칸이면 글자가 한 자씩 줄바꿈된다 → 상태 카드 2개 + 최근 명령은 아래 한 줄
+    Row(Modifier.height(IntrinsicSize.Min), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+        statusPanels()
+        if (wide) recentPanel(Modifier.weight(1.5f).fillMaxHeight())
+    }
+    if (!wide) recentPanel(Modifier.fillMaxWidth())
     SectionHeader("차량")
     ExteriorPanel(state, onAction)
 }
@@ -312,7 +402,7 @@ private fun HomeTab(state: CarState, ui: AgentUi, onAction: (List<Action>) -> Un
 // ───────────────────────── 좌석 ─────────────────────────
 
 @Composable
-private fun SeatsTab(state: CarState, selected: SeatId, onSelect: (SeatId) -> Unit, onAction0: (List<Action>) -> Unit, onAsk0: (String) -> Unit) {
+private fun SeatsTab(state: CarState, selected: SeatId, wide: Boolean, onSelect: (SeatId) -> Unit, onAction0: (List<Action>) -> Unit, onAsk0: (String) -> Unit) {
     val locked = state.driving
     val onAction: (List<Action>) -> Unit = { if (!locked) onAction0(it) }
     val onAsk: (String) -> Unit = { if (!locked) onAsk0(it) }
@@ -353,12 +443,15 @@ private fun SeatsTab(state: CarState, selected: SeatId, onSelect: (SeatId) -> Un
         }
     }
     SectionHeader("추천 자세")
-    Row(dim, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-        QuickTile("휴식 모드", "눕히고 뒤로", Icons.Rounded.Bedtime, false) { onAsk("${selected.label} 휴식 모드") }
-        QuickTile("운전 자세", "바른 자세", Icons.Rounded.SelfImprovement, false) { onAsk("${selected.label} 운전자세") }
-        QuickTile("승하차", "뒤로 · 낮게", Icons.AutoMirrored.Rounded.DirectionsWalk, false) { onAsk("${selected.label} 내릴게") }
-        QuickTile("초기화", "기본 자세", Icons.Rounded.RestartAlt, false) { onAsk("${selected.label} 원래대로") }
-    }
+    TileRows(
+        wide, dim,
+        listOf(
+            { QuickTile("휴식 모드", "눕히고 뒤로", Icons.Rounded.Bedtime, false) { onAsk("${selected.label} 휴식 모드") } },
+            { QuickTile("운전 자세", "바른 자세", Icons.Rounded.SelfImprovement, false) { onAsk("${selected.label} 운전자세") } },
+            { QuickTile("승하차", "뒤로 · 낮게", Icons.AutoMirrored.Rounded.DirectionsWalk, false) { onAsk("${selected.label} 내릴게") } },
+            { QuickTile("초기화", "기본 자세", Icons.Rounded.RestartAlt, false) { onAsk("${selected.label} 원래대로") } },
+        ),
+    )
 }
 
 private val AXIS_ICON = mapOf(
@@ -378,9 +471,9 @@ private val AXIS_HINT = mapOf(
 
 @Composable
 private fun WindowsTab(state: CarState, onAction: (List<Action>) -> Unit, onAsk: (String) -> Unit) {
-    Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-        QuickTile("전체 열기", "측면 창문 100%", Icons.Rounded.UnfoldMore, false) { onAsk("창문 전부 열어") }
-        QuickTile("전체 닫기", "측면 창문 0%", Icons.Rounded.UnfoldLess, false) { onAsk("창문 전부 닫아") }
+    Row(Modifier.height(IntrinsicSize.Min), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+        QuickTile("전체 열기", "측면 창문", Icons.Rounded.UnfoldMore, false) { onAsk("창문 전부 열어") }
+        QuickTile("전체 닫기", "측면 창문", Icons.Rounded.UnfoldLess, false) { onAsk("창문 전부 닫아") }
         QuickTile("환기 모드", "모두 20%", Icons.Rounded.Air, SIDE.all { state.windows.getValue(it) == 20 }) { onAsk("환기") }
     }
     Panel {
@@ -398,7 +491,8 @@ private fun WindowsTab(state: CarState, onAction: (List<Action>) -> Unit, onAsk:
                     },
                     valueRange = 0f..100f,
                     colors = SliderDefaults.colors(thumbColor = Blue, activeTrackColor = Blue, inactiveTrackColor = Line),
-                    modifier = Modifier.width(260.dp),
+                    // 고정 260dp면 세로 화면에서 창문 이름이 한 글자씩 줄바꿈된다 → 남는 폭의 절반까지만
+                    modifier = Modifier.fillMaxWidth(0.5f).widthIn(max = 260.dp),
                 )
             }
         }
@@ -450,7 +544,8 @@ internal fun Panel(
 
 @Composable
 internal fun RowScope.QuickTile(title: String, sub: String, icon: ImageVector, active: Boolean, onClick: () -> Unit) = Column(
-    Modifier.weight(1f).height(132.dp)
+    // 글자가 두 줄이 되면 타일이 늘어난다. 같은 줄 타일 높이는 부모 Row의 IntrinsicSize.Min으로 맞춘다
+    Modifier.weight(1f).fillMaxHeight().heightIn(min = 132.dp)
         .shadow(if (active) 12.dp else 8.dp, RoundedCornerShape(24.dp), spotColor = if (active) Blue else Color(0x22000000))
         .clip(RoundedCornerShape(24.dp))
         .background(if (active) Blue else CardBg)
@@ -461,10 +556,20 @@ internal fun RowScope.QuickTile(title: String, sub: String, icon: ImageVector, a
         Modifier.size(44.dp).clip(CircleShape).background(if (active) Color.White.copy(alpha = 0.2f) else BlueSoft),
         contentAlignment = Alignment.Center,
     ) { Icon(icon, null, tint = if (active) Color.White else Blue, modifier = Modifier.size(22.dp)) }
-    Spacer(Modifier.weight(1f))
-    Text(title, color = if (active) Color.White else Ink, fontSize = 16.sp, fontWeight = FontWeight.SemiBold, maxLines = 1)
-    Text(sub, color = if (active) Color.White.copy(alpha = 0.8f) else Sub, fontSize = 14.sp, maxLines = 1)
+    // 제목은 아이콘 바로 아래 고정 위치. (아래 정렬이면 부제가 두 줄인 타일만 제목이 위로 올라가 옆 타일과 어긋난다)
+    Spacer(Modifier.height(14.dp))
+    Text(title, color = if (active) Color.White else Ink, fontSize = 16.sp, fontWeight = FontWeight.SemiBold, maxLines = 2)
+    Text(sub, color = if (active) Color.White.copy(alpha = 0.8f) else Sub, fontSize = 14.sp, maxLines = 2)
 }
+
+/** 타일 줄. 세로(좁은) 화면에서는 4개를 2×2로 나눈다. 같은 줄 타일은 가장 높은 타일에 높이를 맞춘다. */
+@Composable
+internal fun TileRows(wide: Boolean, modifier: Modifier = Modifier, tiles: List<@Composable RowScope.() -> Unit>) =
+    Column(modifier, verticalArrangement = Arrangement.spacedBy(12.dp)) {
+        tiles.chunked(if (wide || tiles.size < 4) tiles.size else 2).forEach { row ->
+            Row(Modifier.height(IntrinsicSize.Min), horizontalArrangement = Arrangement.spacedBy(12.dp)) { row.forEach { it() } }
+        }
+    }
 
 @Composable
 internal fun SettingRow(icon: ImageVector, title: String, sub: String, trailing: @Composable () -> Unit) = Row(
@@ -531,3 +636,8 @@ private fun Legend(color: Color, label: String) = Row(verticalAlignment = Alignm
 }
 
 private fun level(l: Int) = if (l == 0) "꺼짐" else "${l}단"
+
+/** 화면 표시용: 문장이 끝나면 줄을 바꾼다("바꿨어요. / 등받이를…"). 음성(TTS)에는 원문을 쓴다. */
+private fun sentenceLines(text: String) = text
+    .replace(Regex("(?<=[.!?])\\s+"), "\n")
+    .replace(Regex("약 (?=\\d)"), "약\u00A0") // "약 / 82km"처럼 갈라지지 않게 붙임 공백

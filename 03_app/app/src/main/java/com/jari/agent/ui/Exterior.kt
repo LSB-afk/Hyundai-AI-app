@@ -11,9 +11,11 @@ import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.IntrinsicSize
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.EvStation
@@ -27,9 +29,7 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
-import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.geometry.lerp
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
@@ -90,7 +90,12 @@ private val TAILGATE_A = Offset(402f, 50f)        // 지붕 끝 경첩선
 private val TAILGATE_B = Offset(480f, 80f)
 private val TAILGATE_REACH = Offset(50f, -42f)    // 완전 열림 시 끝단이 경첩에서 뻗는 화면 방향
 // ponytail: 이 각도에서는 실제 충전구(우측 뒤)가 안 보여 보이는 쪽 뒤 펜더에 표시한다
-private val PORT = Rect(495f, 131f, 512f, 144f)
+// 충전구 덮개는 차체 옆면(창문 아랫선 기울기 ≈ -0.4)을 따르는 평행사변형. 앞쪽(왼쪽) 변이 경첩
+private val PORT_HINGE_TOP = Offset(494f, 141f)
+private val PORT_HINGE_BOTTOM = Offset(494f, 155f)
+private val PORT_ACROSS = Offset(18f, -7f) // 경첩 → 덮개 끝 (차체 면을 따라)
+private val PORT_OUT = Offset(-10f, 3.5f)  // 차체 면에서 바깥(보는 사람 쪽)으로 덮개가 젖혀지는 방향
+private const val PORT_SWING = 100f        // 완전 열림 시 덮개 회전각(°)
 
 /** 차량 외관 + 트렁크·프렁크·충전구 조작. 값은 상태를 따라 실제 개폐 속도로 움직인다. */
 @Composable
@@ -131,7 +136,7 @@ fun ExteriorPanel(state: CarState, onAction: (List<Action>) -> Unit) = Panel {
         }
     }
     Text("좌우로 끌어서 돌려보기", color = Sub, fontSize = 14.sp, modifier = Modifier.align(Alignment.CenterHorizontally))
-    Row(Modifier.padding(top = 12.dp), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+    Row(Modifier.padding(top = 12.dp).height(IntrinsicSize.Min), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
         listOf(
             Opening.FRUNK to Icons.Rounded.Inventory2,
             Opening.TRUNK to Icons.Rounded.Luggage,
@@ -193,17 +198,34 @@ private fun DrawScope.drawOpenings(car: ImageBitmap, open: Map<Opening, Float>, 
         drawPath(lid, edge, style = Stroke(1.5f))
     }
 
-    // 충전구: 소켓 → 덮개가 앞쪽 경첩을 축으로 접힌다
-    if (port > 0f) {
-        drawRoundRect(Color(0xFF15191F), PORT.topLeft, PORT.size, CornerRadius(3f))
-        val ring = if (charge > 0f) Color(0xFF2BD47D).copy(alpha = charge) else Color(0xFF2BD47D).copy(alpha = 0.6f * port)
-        drawCircle(ring, 3.5f, PORT.center, style = Stroke(1.8f))
-        scale(1f - 0.85f * port, 1f, pivot = PORT.centerLeft) {
-            drawRoundRect(Color(0xFFDDE3EA), PORT.topLeft, PORT.size, CornerRadius(3f))
-            drawRoundRect(edge, PORT.topLeft, PORT.size, CornerRadius(3f), style = Stroke(1f))
-        }
+    // 충전구: 닫혀 있으면 덮개 이음선만 보이고, 열면 덮개가 앞쪽 경첩을 축으로 바깥으로 젖혀지며 소켓이 드러난다
+    val socket = polygon(
+        PORT_HINGE_TOP.pair(), (PORT_HINGE_TOP + PORT_ACROSS).pair(),
+        (PORT_HINGE_BOTTOM + PORT_ACROSS).pair(), PORT_HINGE_BOTTOM.pair(),
+    )
+    if (port <= 0f) {
+        drawPath(socket, edge.copy(alpha = 0.55f), style = Stroke(0.9f))
+        return
     }
+    drawPath(socket, Brush.linearGradient(listOf(Color(0xFF0B0E12), Color(0xFF2A3038)), PORT_HINGE_TOP, PORT_HINGE_BOTTOM + PORT_ACROSS))
+    val mid = (PORT_HINGE_TOP + PORT_HINGE_BOTTOM + PORT_ACROSS) / 2f // 소켓 중심
+    val ring = Color(0xFF2BD47D).copy(alpha = if (charge > 0f) charge else 0.7f * port)
+    drawCircle(ring, 4f, mid, style = Stroke(1.6f))
+    drawCircle(Color(0xFF8E98A6), 0.9f, mid + Offset(-1.6f, 0.6f))
+    drawCircle(Color(0xFF8E98A6), 0.9f, mid + Offset(1.6f, -0.6f))
+    val a = Math.toRadians((PORT_SWING * port).toDouble())
+    val tip = PORT_ACROSS * kotlin.math.cos(a).toFloat() + PORT_OUT * kotlin.math.sin(a).toFloat()
+    val lid = polygon(
+        PORT_HINGE_TOP.pair(), (PORT_HINGE_TOP + tip).pair(),
+        (PORT_HINGE_BOTTOM + tip).pair(), PORT_HINGE_BOTTOM.pair(),
+    )
+    // 덮개 안쪽 면이 보이기 시작하면(90° 넘김) 살짝 어둡게
+    val lidColor = if (PORT_SWING * port > 90f) Color(0xFFC3CAD3) else Color(0xFFE4E8EE)
+    drawPath(lid, lidColor)
+    drawPath(lid, edge, style = Stroke(1f))
 }
+
+private fun Offset.pair() = x to y
 
 /** 유리가 [open] 만큼 아래로 내려가고, 내려간 자리(위쪽)는 실내가 들여다보인다. [drop] = 완전 개방 시 이동량. */
 private fun DrawScope.glass(shape: Path, open: Float, drop: Float) {

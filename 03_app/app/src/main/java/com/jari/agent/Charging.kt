@@ -36,6 +36,8 @@ const val CAR_Y = 0.58f
 /** ponytail: 아이오닉5 롱레인지 기준 근사. 실차는 EvBattery.getEvBatteryCapacity·효율 API로 대체. */
 const val BATTERY_KWH = 84.0
 const val KM_PER_PERCENT = 4.6
+/** ponytail: 급속 충전 평균 출력(kW). 아이오닉5 롱레인지 초급속 10→80% 약 18분 기준. 예상 충전 시간 계산용 */
+const val CAR_AVG_KW = 190.0
 
 fun station(id: String?) = STATIONS.find { it.id == id }
 fun nearestAvailable() = STATIONS.filter { it.free > 0 }.minBy { it.km }

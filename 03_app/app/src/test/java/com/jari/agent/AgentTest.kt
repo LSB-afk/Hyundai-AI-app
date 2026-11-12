@@ -100,6 +100,38 @@ class AgentTest {
         assertEquals(listOf(Action.Seat(SeatId.DRIVER, Axis.LUMBAR, 50)), plan.actions)
     }
 
+    @Test fun drivingBlocksSmallStepsThatAddUp() {
+        // 주행 시작 때 등받이 30 → "조금"(10)씩 두 번 눕히면 두 번째는 기준점 대비 20이라 막힌다
+        val base = driving.copy(driveBase = DEFAULT_POS)
+        assertEquals(listOf(Action.Seat(SeatId.DRIVER, Axis.RECLINE, 40)), Agent.plan("등받이 조금 눕혀줘", base).actions)
+        val moved = base.withSeat(SeatId.DRIVER) { copy(pos = pos + (Axis.RECLINE to 40)) }
+        val p = Agent.plan("등받이 조금 눕혀줘", moved)
+        assertTrue(p.actions.isEmpty())
+        assertTrue(p.speech.contains("주행 중"))
+    }
+
+    @Test fun wantToClauseIsNotSplit() {
+        val p = Agent.plan("쉬고 싶고 창문 열어줘", parked)
+        assertTrue(Action.Seat(SeatId.DRIVER, Axis.RECLINE, 85) in p.actions)
+        assertTrue(Action.Window(WindowId.FL, 100) in p.actions)
+    }
+
+    @Test fun chargeEndIsNotStop() {
+        val p = Agent.plan("충전 끝나면 운전 자세로 해줘", parked)
+        assertTrue(Action.Charge(false) !in p.actions)
+    }
+
+    @Test fun lumbarHeatOff() {
+        assertEquals(listOf(Action.Heat(SeatId.DRIVER, 0)), Agent.plan("허리 열선 꺼줘", parked).actions)
+    }
+
+    @Test fun stopNavigation() {
+        val guiding = parked.copy(navTo = "epit-pangyo")
+        assertEquals(listOf(Action.StopNavigate), Agent.plan("길안내 종료해줘", guiding).actions)
+        assertEquals(listOf(Action.StopNavigate), Agent.plan("내비 꺼줘", guiding).actions)
+        assertTrue(Agent.plan("안내 그만", parked).speech.contains("길안내 중이 아니에요"))
+    }
+
     @Test fun unknown() {
         assertEquals(Agent.HELP, Agent.plan("오늘 날씨 어때", parked).speech)
     }

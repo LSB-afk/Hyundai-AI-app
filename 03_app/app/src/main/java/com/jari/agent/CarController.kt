@@ -26,13 +26,22 @@ import android.util.Log
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharedFlow
+import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
+
+/** 시뮬레이션 패널에서 바꾸는 차량 신호 */
+sealed interface Sim {
+    data class Battery(val percent: Int) : Sim
+    data class Occupied(val seat: SeatId, val on: Boolean) : Sim
+}
 
 private val SEAT_AREA = mapOf(
     SeatId.DRIVER to SeatArea(SeatValue.ROW_1_LEFT),
@@ -60,7 +69,12 @@ class CarController(context: Context, private val scope: CoroutineScope) {
     private val _state = MutableStateFlow(CarState.initial())
     val state: StateFlow<CarState> = _state.asStateFlow()
 
-    private val jobs = mutableMapOf<Any, Job>()
+    /** 요청 없이 JARI가 알려야 할 일(길안내 시뮬레이션 도착 등). 화면·음성으로 전한다 */
+    private val _events = MutableSharedFlow<String>(extraBufferCapacity = 4)
+    val events: SharedFlow<String> = _events.asSharedFlow()
+
+    // SDK 위치 콜백(바인더 스레드)에서도 읽으므로 동시성 맵
+    private val jobs = java.util.concurrent.ConcurrentHashMap<Any, Job>()
     private val windowBounds = mutableMapOf<WindowId, AreaBounds<Int>>()
     private val doorBounds = mutableMapOf<Opening, AreaBounds<Int>>()
     /** 구동 중 실제 위치가 들어온 시트 축. 이후로는 시간 계산 대신 실제 위치를 따른다. */
@@ -205,6 +219,7 @@ class CarController(context: Context, private val scope: CoroutineScope) {
                 sdk { getSeat().setHvacSeatVentilation(SEAT_AREA.getValue(a.seat), a.level, { _, _ -> }, ::fail) }
             }
             is Action.Navigate -> navigate(a.stationId)
+            Action.StopNavigate -> stopNavigate()
             is Action.Charge -> charge(a.on)
             is Action.ChargeLimit -> {
                 _state.update { it.copy(chargeLimit = a.percent) }
@@ -231,18 +246,48 @@ class CarController(context: Context, private val scope: CoroutineScope) {
         }
     }
 
+    /** Pleos 내비로 길안내. Pleos 내비가 없는 환경(일반 에뮬레이터)에서는 앱 안에서 안내를 시뮬레이션한다. */
     private fun navigate(id: String) {
         val st = station(id) ?: return
-        _state.update { it.copy(navTo = id) }
-        runCatching {
-            navi?.requestRoute(
-                RouteInfo(latitude = st.lat, longitude = st.lon, poiName = st.name, poiId = st.id, address = st.address, poiSubId = "0"),
-            )
-        }.onFailure(::fail)
+        jobs.remove(NAV)?.cancel()
+        _state.update { it.copy(navTo = id, navProgress = 0f) }
+        val pleos = navi?.let { n ->
+            runCatching {
+                n.requestRoute(RouteInfo(latitude = st.lat, longitude = st.lon, poiName = st.name, poiId = st.id, address = st.address, poiSubId = "0"))
+            }.onFailure(::fail).isSuccess
+        } ?: false
+        if (!pleos) simulateRoute(st)
+    }
+
+    /**
+     * 데모용 안내: 기어를 D로 두고 지도 위 경로를 따라간다. 소요 시간 1분을 [SIM_SEC_PER_MIN]초로 줄여 보여준다.
+     * 도중에 P로 바꾸면 멈췄다가 D면 이어 가고, 도착하면 P로 바꾸고 알린다.
+     */
+    private fun simulateRoute(st: Station) {
+        if (!_state.value.live) setDriving(true)
+        val step = 100f / (st.minutes * SIM_SEC_PER_MIN * 1000f)
+        jobs[NAV] = scope.launch {
+            while (_state.value.navProgress < 1f) {
+                delay(100)
+                if (_state.value.driving) _state.update { it.copy(navProgress = (it.navProgress + step).coerceAtMost(1f)) }
+            }
+            jobs.remove(NAV)
+            _state.update { it.copy(navTo = null, navProgress = 0f) }
+            if (!_state.value.live) setDriving(false)
+            _events.tryEmit("${st.name}에 도착했어요. 충전을 시작하면 시트를 휴식 모드로 바꿔 드릴게요.")
+        }
+    }
+
+    private fun stopNavigate() {
+        val simulated = jobs.remove(NAV)?.also { it.cancel() } != null
+        if (!simulated) runCatching { navi?.cancelRoute() }.onFailure(::fail)
+        _state.update { it.copy(navTo = null, navProgress = 0f) }
+        if (simulated && !_state.value.live) setDriving(false)
     }
 
     private fun charge(on: Boolean) {
-        _state.update { it.copy(charging = on, chargeStart = if (on) it.battery else it.chargeStart, driving = if (on) false else it.driving) }
+        _state.update { it.copy(charging = on, chargeStart = if (on) it.battery else it.chargeStart) }
+        if (on) setDriving(false)
         sdk { getEvBattery().setEvChargeSwitch(on, { }, ::fail) }
         jobs.remove("charge")?.cancel()
         // 실차는 SoC 리스너가 갱신. 시뮬레이션에서만 충전 진행을 흉내낸다.
@@ -259,9 +304,18 @@ class CarController(context: Context, private val scope: CoroutineScope) {
         if (soc != null) _state.update { it.copy(battery = soc) }
     }
 
+    /** 시뮬레이션 모드에서만: 배터리·탑승 좌석을 바꾼다 (데모용). 실차에서는 차량 신호를 따른다. */
+    fun sim(c: Sim) {
+        if (_state.value.live) return
+        when (c) {
+            is Sim.Battery -> _state.update { it.copy(battery = c.percent.coerceIn(0, 100)) }
+            is Sim.Occupied -> _state.update { it.withSeat(c.seat) { copy(occupied = c.on) } }
+        }
+    }
+
     /** 시뮬레이션 모드에서만: 주행/정차 전환 (데모용). 실차에서는 기어 신호를 따른다. */
     fun toggleDriving() {
-        if (!_state.value.live) _state.update { it.copy(driving = !it.driving) }
+        if (!_state.value.live) setDriving(!_state.value.driving)
     }
 
     fun release() {
@@ -276,7 +330,17 @@ class CarController(context: Context, private val scope: CoroutineScope) {
     }
 
     private fun onGear(gear: VehicleGear?) {
-        _state.update { it.copy(driving = gear != null && gear != VehicleGear.GEAR_PARK && gear != VehicleGear.GEAR_UNKNOWN) }
+        setDriving(gear != null && gear != VehicleGear.GEAR_PARK && gear != VehicleGear.GEAR_UNKNOWN)
+    }
+
+    /**
+     * 주행 시작: 그 순간의 운전석 자세를 안전 가드 기준점으로 잡고, 정차 중에 시작한 운전석 자세 변경(허리 지지 제외)은 멈춘다.
+     * 기어 콜백은 바인더 스레드에서도 오므로 Job 취소만 하고, 모터 STOP은 각 Job의 finally가 보낸다.
+     */
+    private fun setDriving(driving: Boolean) {
+        val was = _state.value.driving
+        _state.update { it.copy(driving = driving, driveBase = if (driving) it.driveBase ?: it.seat(SeatId.DRIVER).pos else null) }
+        if (driving && !was) Axis.entries.filter { it != Axis.LUMBAR }.forEach { jobs.remove(SeatId.DRIVER to it)?.cancel() }
     }
 
     /**
@@ -366,5 +430,8 @@ class CarController(context: Context, private val scope: CoroutineScope) {
         private const val TAG = "JARI"
         /** 시트 1% 이동 시간(ms). 실차 보정 노브. */
         const val MS_PER_PERCENT = 35L
+        /** 길안내 시뮬레이션: 소요 1분을 몇 초로 보여줄지 */
+        const val SIM_SEC_PER_MIN = 4f
+        private const val NAV = "nav"
     }
 }

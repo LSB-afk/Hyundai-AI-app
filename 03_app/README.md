@@ -57,7 +57,7 @@
 | Vehicle 2.3.2 | `EvBattery.setEvChargePortOpen`, `registerEvChargePortOpen` | `CAR_ENERGY` / `CONTROL_CAR_ENERGY` |
 | Vehicle 2.3.2 | `Gear.registerGearSelection` | `CAR_DRIVE` |
 | Vehicle 2.3.2 | `EvBattery.getEvBatteryStateOfCharge`, `registerEvBatteryStateOfCharge` / `setEvChargeSwitch`, `setEvChargePercentLimit` | `CAR_ENERGY` / `CONTROL_CAR_ENERGY` |
-| NaviHelper 3.0.5 | `requestRoute(RouteInfo)` | `NAVI_ROUTE` |
+| NaviHelper 3.0.5 | `requestRoute(RouteInfo)` | `NAVI_ROUTE_SEARCH` |
 | SpeechToText 3.3.1 | `request / stop`, `ResultListener` (ON_DEVICE) | `STT_SERVICE` |
 | TextToSpeech 3.3.1 | `speak` (ON_DEVICE) | `TTS_SERVICE` |
 

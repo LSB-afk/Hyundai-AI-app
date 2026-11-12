@@ -36,6 +36,8 @@ data class CarState(
     val charging: Boolean = false,
     val chargeStart: Int = 34, // 충전 시작 시 SoC (충전량 계산용)
     val navTo: String? = null, // 길안내 중인 충전소 id
+    val navProgress: Float = 0f, // 앱 안 길안내 시뮬레이션 진행률 0..1 (Pleos 내비가 없을 때)
+    val driveBase: Map<Axis, Int>? = null, // 주행을 시작할 때의 운전석 자세 (안전 가드 기준점)
     val openings: Map<Opening, Int> = Opening.entries.associateWith { 0 },
 ) {
     val rangeKm get() = (battery * KM_PER_PERCENT).toInt()
@@ -65,6 +67,7 @@ sealed interface Action {
     data class Vent(val seat: SeatId, val level: Int) : Action
     data class Window(val window: WindowId, val percent: Int) : Action
     data class Navigate(val stationId: String) : Action
+    data object StopNavigate : Action
     data class Charge(val on: Boolean) : Action
     data class ChargeLimit(val percent: Int) : Action
     data class Open(val opening: Opening, val open: Boolean) : Action
@@ -83,7 +86,8 @@ object Agent {
     /** 주행 중 운전석 자세가 이 값(%)보다 크게 바뀌면 차단. */
     const val DRIVING_LIMIT = 10
 
-    private val CLAUSE = Regex("그리고|(?<=[가-힣])(?<!최)고\\s+|,\\s*|다음에?\\s+")
+    // "~고 싶어"의 "고"는 절 경계가 아니다 ("쉬고 싶고 창문 열어줘" → "쉬고 싶" / "창문 열어줘")
+    private val CLAUSE = Regex("그리고|(?<=[가-힣])(?<!최)고\\s+(?!싶)|,\\s*|다음에?\\s+")
     private val SEAT_WORD = Regex("모든 ?좌석|전체 ?좌석|전좌석|운전석|조수석|옆자리|뒷좌석 ?(왼쪽|오른쪽)?|뒷자리 ?(왼쪽|오른쪽)?")
 
     fun plan(raw: String, s: CarState): Plan {
@@ -103,6 +107,10 @@ object Agent {
     private fun planOne(raw: String, s: CarState): Plan {
         val t = raw.replace(" ", "")
         if (t.isBlank()) return Plan(emptyList(), HELP)
+        if (t.has("안내", "내비") && t.has("종료", "그만", "취소", "멈춰", "꺼")) return Plan(
+            listOf(Action.StopNavigate),
+            if (s.navTo == null) "지금은 길안내 중이 아니에요." else "길안내를 종료할게요.",
+        )
         if (t.has("창문", "창", "윈도우", "선루프", "썬루프", "환기", "답답")) return guard(windows(t), s)
         openings(t)?.let { return guard(it, s) }
         charging(t, s)?.let { return it }
@@ -119,7 +127,7 @@ object Agent {
                 )
                 Plan(posture(REST), "${names(seats)} 휴식 모드로 바꿨어요. 등받이를 눕히고 시트를 뒤로 뺐어요.")
             }
-            t.has("허리") && !t.has("줄여", "약하게", "빼") -> Plan(
+            t.has("허리") && !t.has("줄여", "약하게", "빼", "열선", "통풍") -> Plan(
                 seats.flatMap { listOf(Action.Seat(it, Axis.LUMBAR, 80), Action.Heat(it, 2)) },
                 "${names(seats)} 허리 지지대를 높이고 열선을 2단으로 켰어요. 오래 운전하신다면 한 시간마다 스트레칭 해주세요.",
             )
@@ -154,13 +162,15 @@ object Agent {
 
     /**
      * 안전 가드: 주행 중 운전석 자세(허리 지지 제외)를 크게 바꾸거나 트렁크·프렁크·충전구를 여는 동작은 제거한다.
+     * 기준은 주행을 시작할 때의 자세라서 "조금씩" 여러 번 나눠 말해도 합계가 한도를 넘으면 막힌다.
      * 수동 조작도 이 경로를 탄다.
      */
     fun guard(plan: Plan, s: CarState): Plan {
         if (!s.driving) return plan
+        val base = s.driveBase ?: s.seat(SeatId.DRIVER).pos
         val seats = plan.actions.filterIsInstance<Action.Seat>().filter {
             it.seat == SeatId.DRIVER && it.axis != Axis.LUMBAR &&
-                kotlin.math.abs(it.value - s.seat(SeatId.DRIVER).pos.getValue(it.axis)) > DRIVING_LIMIT
+                kotlin.math.abs(it.value - base.getValue(it.axis)) > DRIVING_LIMIT
         }
         val opens = plan.actions.filterIsInstance<Action.Open>().filter { it.open }
         if (seats.isEmpty() && opens.isEmpty()) return plan
@@ -224,7 +234,8 @@ object Agent {
                     "${st.km}km 거리 ${st.minutes}분이에요. 길안내를 시작할게요.",
             )
         }
-        t.has("충전") && t.has("멈춰", "중지", "그만", "끝") ->
+        // "충전 끝나면 ~"은 충전을 멈추라는 말이 아니다
+        t.has("충전") && t.has("멈춰", "중지", "그만", "끝") && !t.has("끝나면", "끝나고") ->
             Plan(listOf(Action.Charge(false)), "충전을 멈췄어요. 현재 배터리는 ${s.battery}%예요.")
         else -> null
     }
