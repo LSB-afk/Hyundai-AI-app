@@ -309,7 +309,7 @@ private fun AgentCard(ui: AgentUi, onAsk: (String) -> Unit, onMic: () -> Unit, t
             }
         }
     } else {
-        Text("주행 중에는 키보드 입력이 제한돼요. 마이크를 누르거나 아래 추천 문장을 눌러 주세요.", color = Sub, fontSize = 14.sp)
+        Text(sentenceLines("주행 중에는 키보드 입력이 제한돼요. 마이크를 누르거나 아래 추천 문장을 눌러 주세요."), color = Sub, fontSize = 14.sp)
     }
     Spacer(Modifier.height(12.dp))
     Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
