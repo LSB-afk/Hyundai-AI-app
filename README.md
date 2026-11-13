@@ -1,40 +1,63 @@
-# 현대차그룹 차량용 앱 개발 공모전 워크스페이스
+# JARI (자리) — 몸 상태를 말하면 자리를 맞춰주는 차량 AI 에이전트
 
-**마감: 2026-11-15(일) 23:59** · 접수: appdevchallenge@hyundai-partners.com
+> "허리가 아파", "너무 졸려"처럼 **기능이 아니라 몸 상태를 말하면** 시트·창문·열선/통풍을 알아서 조합하고,
+> 말하지 않아도 2시간째 운전 중이면 먼저 자세를 바꿔 주는 Pleos Connect 앱입니다.
 
+- 팀명: **GoAim**
+- APK: [`apk/GoAim_JARI_release.apk`](apk/GoAim_JARI_release.apk) (release 빌드)
+- 소스: [`03_app/`](03_app) — 기능·구조·SDK 사용 상세는 [`03_app/README.md`](03_app/README.md)
+
+![home](02_기획서/화면시안/portrait_home.png)
+
+## 주요 기능
+- **음성 에이전트**: Pleos STT(ON_DEVICE) → 발화 해석 → Vehicle SDK 실행 → Pleos TTS 응답. 복합 문장("조수석 눕히고 열선 켜줘") 지원
+- **좌석·창문 제어**: 4개 좌석 앞뒤·등받이·높이·허리 지지 + 열선·통풍, 측면 창문 4개 + 선루프, 트렁크·프렁크·충전구
+- **주행 안전 가드**: 기어가 P가 아니면 운전석 자세 큰 변경·열기 동작 차단, 주행 중 키보드 입력 숨김(음성만 허용)
+- **먼저 챙기기**: 연속 운전 2시간마다 허리 지지대 변경·휴식 권유, 배터리 20% 이하 충전소 안내, 장거리 후 정차 시 휴식 제안
+- **EV 충전**: 빈 충전기가 있는 가장 가까운 충전소로 NaviHelper 길안내, 충전 중 휴식 자세 → 충전 종료 시 운전 자세 복귀
+
+## 실행 방법
+1. Pleos Connect 에뮬레이터(v2.1.0)를 실행합니다. 설치 방법: [`03_app/SETUP.md`](03_app/SETUP.md)
+2. APK를 설치합니다.
+   ```bash
+   adb install -r apk/GoAim_JARI_release.apk
+   ```
+   (에뮬레이터 창에 APK 파일을 끌어다 놓아도 됩니다.)
+3. 런처에서 **JARI**를 실행하고 마이크 버튼을 누르거나, 추천 문장·입력창을 사용합니다.
+   - 예) "허리가 아파", "조수석 좀 눕혀줘", "너무 졸려", "충전소 찾아줘", "트렁크 열어줘"
+
+소스에서 빌드할 때 (JDK 17):
+```bash
+cd 03_app
+./gradlew assembleRelease        # app/build/outputs/apk/release/app-release.apk
+./gradlew testDebugUnitTest      # 에이전트 규칙·안전 가드 단위 테스트
 ```
-01_공모요강/   요강정리.md, 접수양식_동의서.docx (원본 양식 = 기획서)
-02_기획서/     기획서_초안.md → 완성 후 docx에 옮김
-03_app/        Android(Pleos Connect) 앱. SETUP.md 참고
-04_제출/       최종 docx, 영상, 메일 본문
-```
 
-## 분석 요약
-
-- **1차는 서류만으로 지원 가능**, 하지만 영상·GitHub·APK는 *단계별 가산점*. 20팀 → 2차 PT에서 **실제 동작 시연 필수**.
-- 심사 4축: 차량특화성 · 창의성 · SDK 활용성 · 사업성. 핵심 질문은 "**왜 폰이 아니라 차여야 하는가**".
-- SDK가 5개뿐(Vehicle, FusedLocation, NaviHelper, TTS, STT) → 아이디어는 이 조합으로 *핵심 기능*이 성립해야 함. 외부 데이터/AI는 보조.
-- 운영측 예시(음성메모, 안전운전 점수, 배달기사)는 뻔한 축 → 피하거나 확실히 비틀기.
-- 부문 분리(대학생/일반) → 부문별 대상·최우수·우수 4팀씩.
-
-## 6일 계획
-
-| 날짜 | 할 일 |
+## 테스트 환경 및 필요한 설정
+| 항목 | 내용 |
 |---|---|
-| 11/9 (일) | 아이디어 확정, Android Studio + 에뮬레이터 설치 |
-| 11/10–11 | 기획서 1~6 작성, Sample App으로 신호 지원 여부 확인 |
-| 11/12–13 | 최소 프로토타입(핵심 화면 1~2개 + SDK 1개 실연동) |
-| 11/14 | 화면 녹화 영상, GitHub(README·APK), 기획서 docx 옮기기 |
-| 11/15 | 서명·동의서, 메일 발송 (오전 중 권장) |
+| 개발·테스트 에뮬레이터 | **Pleos Connect Emulator v2.1.0** (Android Automotive, API 34) |
+| 화면 규격 | Pleos 멀티 윈도우 기준 세로 창 1개 ≈ **841×1210**, 가로(창 2개) ≈ **1682×1210** — 두 레이아웃 모두 대응 |
+| 추가 확인 환경 | Android Emulator Pixel 8 (API 35, 1080×2400) — 시뮬레이션 모드 |
+| 빌드 | JDK 17, AGP 8.8.2, Kotlin 2.0.21, compileSdk/targetSdk 35, minSdk 28 |
+| 사용 SDK | Vehicle 2.3.2, SpeechToText 3.3.1, TextToSpeech 3.3.1, NaviHelper 3.0.5 |
 
-## 제출 체크리스트
+**필요한 설정**
+- Pleos 권한(`CAR_SEATS`, `CONTROL_CAR_WINDOWS`, `NAVI_ROUTE_SEARCH`, `STT_SERVICE` 등)은 Manifest에 선언돼 있어 별도 설정이 필요 없습니다.
+- 음성 입력을 쓰려면 에뮬레이터의 마이크 접근을 허용해야 합니다. ([Pleos 에뮬레이터 설정 가이드](https://document.pleos.ai/docs/connect/guide/getting-started/application-development/configure-pleos-connect-emulator))
+- Pleos STT/TTS가 없는 환경에서는 안드로이드 기본 음성인식·TTS로 대체하며, 처음 마이크를 누를 때 마이크 권한을 요청합니다.
+- Vehicle 서비스에 연결할 수 없으면 자동으로 **시뮬레이션 모드**로 실행됩니다. 오른쪽 위 **시뮬레이션** 칩을 누르면 기어(P/D), 배터리 잔량, 탑승 좌석을 바꿔 볼 수 있습니다.
+  - 예) D 주행 + 배터리 20% 이하 → JARI가 먼저 충전소 안내를 제안
+  - "2시간 연속 운전" 알림은 release 빌드에서 실제 시간(2시간)으로 셉니다. debug 빌드(`./gradlew installDebug`)는 시연용으로 1초를 1분으로 세서 D 상태 2분이면 알림이 나옵니다.
+- Pleos 내비가 없는 환경에서는 충전소 길안내를 앱 안에서 시뮬레이션합니다.
 
-- [ ] 참가 부문 결정 (대학(원)생 / 일반)
-- [ ] 01 참가신청서 기본정보·구성원
-- [ ] 02 기획서 1~6 (개인정보 X)
-- [ ] 03·04 동의서 전원 서명
-- [ ] 시연 영상 (목업/화면녹화 OK)
-- [ ] GitHub: 소스 + `apk/팀명_앱이름_release.apk` + README(소개·실행법·환경·APK위치)
-- [ ] Private이면 심사용 계정 Collaborator 초대 & 접근 확인
-- [ ] 메일 제목 형식, 팀원 전원 CC
-- [ ] (선택) 숏폼 링크
+## APK 위치
+[`apk/GoAim_JARI_release.apk`](apk/GoAim_JARI_release.apk)
+
+## 저장소 구조
+```
+03_app/        Android(Kotlin, Jetpack Compose) 앱 소스
+apk/           release APK
+02_기획서/     기획서 초안, 화면 시안
+01_공모요강/   공모 요강 정리, 접수 양식
+```

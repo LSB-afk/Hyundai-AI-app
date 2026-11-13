@@ -63,9 +63,11 @@
 
 ## 실행 방법
 1. Android Studio + Pleos Connect Emulator v2.1.0 (API 34) 준비 — `SETUP.md`
-2. `./gradlew installDebug` 또는 저장소 루트 `apk/JARI_release.apk` 설치
+2. `./gradlew installDebug` 또는 저장소 루트 `apk/GoAim_JARI_release.apk` 설치
 3. 런처에서 **JARI** 실행. 마이크 버튼 또는 추천 문장/입력창 사용
 - Vehicle Service가 없는 환경에서는 자동으로 **시뮬레이션 모드** (우상단 칩 표시). 이때 `P 정차` 칩을 눌러 주행/정차 전환 가능
+  - 우상단 **시뮬레이션** 칩을 누르면 기어(P/D)·배터리 잔량·탑승 좌석을 바꾸는 패널이 열린다
+  - Pleos STT/TTS가 없으면 안드로이드 기본 음성인식·TTS로 대체(마이크 권한 요청), Pleos 내비가 없으면 길안내를 앱 안에서 시뮬레이션
 
 ## 테스트 환경
 - JDK 17, AGP 8.8.2, Kotlin 2.0.21, compileSdk 35, minSdk 28
@@ -73,7 +75,7 @@
 - 화면 스냅샷 재생성: `./gradlew recordPaparazziDebug` → `app/src/test/snapshots/images`
 
 ## APK
-`apk/팀명_JARI_release.apk` (제출 시 팀명으로 변경)
+저장소 루트 `apk/GoAim_JARI_release.apk`
 
 ## 구조
 ```
@@ -81,7 +83,7 @@ app/src/main/java/com/jari/agent/
   Agent.kt          발화 → 제어 계획 + 안전 가드 (순수 Kotlin, 테스트 대상)
   CarController.kt  Pleos Vehicle SDK 브리지 + 시뮬레이션
   Charging.kt       충전소 데모 데이터
-  Voice.kt          Pleos STT/TTS 래퍼
+  Voice.kt          Pleos STT/TTS 래퍼 (없으면 안드로이드 기본 음성으로 대체)
   MainActivity.kt   연결
   ui/               Compose 화면 (App, Cabin3D, Exterior, ChargeScreens, Theme)
 ```
